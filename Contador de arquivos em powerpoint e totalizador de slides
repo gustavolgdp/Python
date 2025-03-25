@@ -1,0 +1,29 @@
+import os
+from pptx import Presentation
+
+# Caminho da pasta onde estão os PowerPoints
+root_folder = r"C:\Users\lgust\OneDrive\Skyfidence\Airjet\Conteúdos"
+
+# Variáveis para contar
+total_slides = 0
+arquivos_info = []
+
+# Procurar arquivos .pptx
+for root, dirs, files in os.walk(root_folder):
+    for file in files:
+        if file.lower().endswith(".pptx"):
+            caminho = os.path.join(root, file)
+            try:
+                prs = Presentation(caminho)
+                num_slides = len(prs.slides)
+                total_slides += num_slides
+                arquivos_info.append((caminho, num_slides))
+            except Exception as e:
+                print(f"Erro em {caminho}: {e}")
+
+# Mostrar os resultados
+print(f"\nTotal de arquivos PowerPoint: {len(arquivos_info)}")
+print(f"Total de slides: {total_slides}\n")
+
+for caminho, slides in arquivos_info:
+    print(f"{caminho} --> {slides} slides")
