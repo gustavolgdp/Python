@@ -1,0 +1,49 @@
+import os
+import time
+import comtypes.client
+from tqdm import tqdm
+
+pasta_origem = r"C:\Users\lgust\OneDrive\Skyfidence\Airjet\Conteúdos"
+pasta_destino = r"C:\Users\lgust\OneDrive\Área de Trabalho\PDF"
+
+def converter_pptx_para_pdf(origem, destino):
+    if not os.path.exists(destino):
+        os.makedirs(destino)
+
+    arquivos_pptx = []
+    for raiz, _, arquivos in os.walk(origem):
+        for arquivo in arquivos:
+            if arquivo.lower().endswith(".pptx"):
+                arquivos_pptx.append(os.path.join(raiz, arquivo))
+
+    if not arquivos_pptx:
+        print("Nenhum arquivo .pptx encontrado.")
+        return
+
+    print(f"Total de arquivos encontrados: {len(arquivos_pptx)}")
+
+    ppt_app = comtypes.client.CreateObject("PowerPoint.Application")
+    ppt_app.Visible = 1
+
+    for caminho_pptx in tqdm(arquivos_pptx, desc="Convertendo arquivos", unit="arquivo"):
+        nome_arquivo = os.path.splitext(os.path.basename(caminho_pptx))[0]
+        caminho_pdf = os.path.join(destino, nome_arquivo + ".pdf")
+
+        try:
+            apresentação = ppt_app.Presentations.Open(caminho_pptx, WithWindow=False)
+            apresentação.SaveAs(caminho_pdf, 32)
+            apresentação.Close()
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"\n[ERRO] Falha ao converter: {caminho_pptx}")
+            print(f"Motivo: {e}")
+            continue
+
+    try:
+        ppt_app.Quit()
+    except Exception as e:
+        print(f"[Aviso] Falha ao encerrar PowerPoint: {e}")
+
+    print("✅ Conversão concluída com sucesso.")
+
+converter_pptx_para_pdf(pasta_origem, pasta_destino)
