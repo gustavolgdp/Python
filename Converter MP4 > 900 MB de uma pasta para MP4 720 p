@@ -1,0 +1,54 @@
+import os
+import subprocess
+from tqdm import tqdm
+
+# Caminhos fornecidos por você
+pasta_origem = r"C:\Users\lgust\OneDrive\Skyfidence\Airjet\Conteúdos"
+pasta_destino = r"C:\Users\lgust\OneDrive\Área de Trabalho\MP4_Convertidos"
+
+# Caminho completo para o executável do FFmpeg
+ffmpeg_exe = r"C:\ffmpeg\bin\ffmpeg.exe"
+
+def converter_mp4_para_720p(origem, destino, tamanho_limite_mb=900):
+    if not os.path.exists(destino):
+        os.makedirs(destino)
+
+    arquivos_grandes = []
+    for raiz, _, arquivos in os.walk(origem):
+        for arquivo in arquivos:
+            if arquivo.lower().endswith(".mp4"):
+                caminho_arquivo = os.path.join(raiz, arquivo)
+                tamanho_mb = os.path.getsize(caminho_arquivo) / (1024 * 1024)
+                if tamanho_mb > tamanho_limite_mb:
+                    arquivos_grandes.append(caminho_arquivo)
+
+    if not arquivos_grandes:
+        print("Nenhum arquivo MP4 acima de 900 MB encontrado.")
+        return
+
+    for caminho_entrada in tqdm(arquivos_grandes, desc="Convertendo vídeos", unit="vídeo"):
+        nome_arquivo = os.path.splitext(os.path.basename(caminho_entrada))[0]
+        caminho_saida = os.path.join(destino, nome_arquivo + "_720p.mp4")
+
+        comando = [
+            ffmpeg_exe,
+            "-i", caminho_entrada,
+            "-vf", "scale=-1:720",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            caminho_saida
+        ]
+
+        try:
+            subprocess.run(comando, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"\n[ERRO] Falha ao converter: {caminho_entrada}")
+            print(f"Detalhes: {e}")
+
+    print("✅ Conversão de vídeos concluída.")
+
+# Executar
+converter_mp4_para_720p(pasta_origem, pasta_destino)
