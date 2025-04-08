@@ -1,0 +1,61 @@
+import os
+import pandas as pd
+import PyPDF2
+from tqdm import tqdm
+
+# Diretório onde os PDFs estão armazenados
+
+diretorio = r'C:\Users\lgust\OneDrive\2- LRO APP-SP'
+
+# Palavra a ser buscada
+
+palavra_busca = "balão"
+
+# Caminho para salvar o arquivo de saída
+
+caminho_saida = r'C:\Users\lgust\OneDrive\Área de Trabalho\Resultados_Busca_Balao.xlsx'
+
+# Lista para armazenar os resultados
+
+resultados = []
+
+# Função para contar ocorrências da palavra em um PDF
+
+def contar_palavra_pdf(caminho_arquivo, palavra):
+contador = 0
+try:
+with open(caminho_arquivo, 'rb') as arquivo_pdf:
+leitor_pdf = PyPDF2.PdfReader(arquivo_pdf)
+for pagina in leitor_pdf.pages:
+texto = pagina.extract_text()
+if texto:
+# Contar ocorrências, independente de maiúsculas/minúsculas e variando "~"
+contador += texto.lower().count(palavra.lower())
+contador += texto.lower().count(palavra.lower().replace("ã", "a"))
+except Exception as e:
+print(f"Erro ao processar o arquivo {caminho_arquivo}: {e}")
+return contador
+
+# Percorrer o diretório e subpastas em busca dos arquivos PDF
+
+arquivos_pdf = []
+for raiz, _, arquivos in os.walk(diretorio):
+for arquivo in arquivos:
+if arquivo.lower().endswith('.pdf'):
+arquivos_pdf.append(os.path.join(raiz, arquivo))
+
+# Iterar sobre os arquivos com uma barra de progresso
+
+for caminho_arquivo in tqdm(arquivos_pdf, desc="Processando arquivos PDF"):
+contagem = contar_palavra_pdf(caminho_arquivo, palavra_busca)
+# Adicionar resultado à lista
+resultados.append({"Nome do arquivo": os.path.basename(caminho_arquivo), "Quantidade de vezes": contagem})
+
+# Criar um DataFrame com os resultados
+
+df_resultados = pd.DataFrame(resultados)
+
+# Salvar em uma planilha Excel na Área de Trabalho
+
+df_resultados.to_excel(caminho_saida, index=False)
+print("Processo concluído. Planilha salva na Área de Trabalho como 'Resultados_Busca_Balao.xlsx'.")
