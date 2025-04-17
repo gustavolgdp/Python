@@ -1,0 +1,67 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+from tqdm import tqdm
+import numpy as np
+
+# Caminho do arquivo
+arquivo = r"C:\Python\Ranking_Aerodromos_2024.xlsx"
+
+# Leitura da aba "TMA"
+df = pd.read_excel(arquivo, sheet_name="TMA")
+
+# Seleção e padronização dos dados
+X = df[["Movimento"]].copy()
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Encontrar o melhor número de clusters via silhueta
+range_n = range(2, 11)
+scores = []
+modelos = []
+
+print("Analisando número ótimo de clusters...")
+for k in tqdm(range_n, desc="Avaliando K-Means"):
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+    labels = kmeans.fit_predict(X_scaled)
+    score = silhouette_score(X_scaled, labels)
+    scores.append(score)
+    modelos.append(kmeans)
+
+# Melhor K e modelo correspondente
+melhor_k = range_n[np.argmax(scores)]
+modelo_final = modelos[np.argmax(scores)]
+
+# Aplicar o modelo ao dataframe
+df["Cluster"] = modelo_final.predict(X_scaled)
+
+# Recuperar os centróides reais (despadronizados)
+centroides = scaler.inverse_transform(modelo_final.cluster_centers_)
+
+# Exibir centróides
+print("\nCentróides por cluster:")
+for i, c in enumerate(centroides):
+    print(f"Cluster {i}: {int(c[0])} movimentos")
+
+# Plotar gráfico de dispersão
+plt.figure(figsize=(10, 6))
+cores = plt.cm.get_cmap('tab10', melhor_k)
+
+for i in range(melhor_k):
+    grupo = df[df["Cluster"] == i]
+    plt.scatter(grupo["Ranking"], grupo["Movimento"], label=f"Cluster {i}", s=70)
+
+# Plotar centróides
+plt.scatter(df["Ranking"], df["Movimento"], c=df["Cluster"], cmap='tab10')
+plt.scatter([df[df["Cluster"] == i]["Ranking"].mean() for i in range(melhor_k)],
+            centroides.flatten(), c='black', marker='x', s=100, label='Centróides')
+
+plt.title(f"Clusterização K-Means por Movimento - k = {melhor_k}")
+plt.xlabel("Ranking")
+plt.ylabel("Movimento")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
