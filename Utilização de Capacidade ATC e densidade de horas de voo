@@ -1,0 +1,143 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+from datetime import datetime, timedelta
+
+# --- CONFIGURAÇÕES INICIAIS ---
+
+# Arquivo CSV
+caminho_csv = r'C:\\Python\\MOV_TMA-SP_2025_03_21_2025_03_31.csv'
+
+# Capacidades horárias corretas dos setores
+capacidades = {
+    'T1': 48, 'T2': 47, 'T3': 45, 'T4': 41, 'T5': 45, 'T6': 50,
+    'T7': 47, 'T8': 45, 'T9': 37, 'T10': 35, 'T11': 35, 'T12': 45,
+    'T13': 45, 'VFR': 35
+}
+
+# Setores considerados
+setores_validos = list(capacidades.keys())
+
+# --- CARREGAMENTO DOS DADOS ---
+
+df = pd.read_csv(caminho_csv)
+
+# --- PRÉ-PROCESSAMENTO ---
+
+def organizar_movimentos(df):
+    registros = []
+    registros_sem_saida = []
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processando movimentos"):
+        setores = [('H1C', 'S1'), ('H2C', 'S2'), ('H3C', 'S3'), ('H4C', 'S4')]
+        for i in range(len(setores)):
+            hora_entrada = row[setores[i][0]]
+            setor = row[setores[i][1]]
+            if pd.notna(hora_entrada) and setor in setores_validos:
+                hora_entrada = pd.to_datetime(str(hora_entrada)).time()
+                if i < len(setores) - 1:
+                    proxima_hora = row[setores[i+1][0]]
+                    if pd.notna(proxima_hora):
+                        hora_saida = pd.to_datetime(str(proxima_hora)).time()
+                        registros.append({
+                            'Data': row['DATAREAL'],
+                            'Indicativo': row['INDICATIVO'],
+                            'Setor': setor,
+                            'Hora_Entrada': hora_entrada,
+                            'Hora_Saida': hora_saida,
+                            'Saida_Definida': True
+                        })
+                    else:
+                        registros_sem_saida.append({
+                            'Data': row['DATAREAL'],
+                            'Indicativo': row['INDICATIVO'],
+                            'Setor': setor,
+                            'Hora_Entrada': hora_entrada,
+                            'Hora_Saida': None,
+                            'Saida_Definida': False
+                        })
+                else:
+                    registros_sem_saida.append({
+                        'Data': row['DATAREAL'],
+                        'Indicativo': row['INDICATIVO'],
+                        'Setor': setor,
+                        'Hora_Entrada': hora_entrada,
+                        'Hora_Saida': None,
+                        'Saida_Definida': False
+                    })
+    return pd.DataFrame(registros), pd.DataFrame(registros_sem_saida)
+
+# Organizar movimentos
+df_mov, df_mov_sem_saida = organizar_movimentos(df)
+
+# Converter Hora_Entrada e Hora_Saida para datetime
+
+df_mov['Hora_Entrada_dt'] = pd.to_datetime(df_mov['Hora_Entrada'].astype(str))
+df_mov['Hora_Saida_dt'] = pd.to_datetime(df_mov['Hora_Saida'].astype(str))
+
+# Calcular tempo de voo no setor definido
+df_mov['Tempo_Setor_min'] = (df_mov['Hora_Saida_dt'] - df_mov['Hora_Entrada_dt']).dt.total_seconds() / 60
+
+# Calcular tempo médio por setor
+tempo_medio_setor = df_mov.groupby('Setor')['Tempo_Setor_min'].mean()
+
+# Para registros sem hora de saída, atribuir tempo médio do setor
+df_mov_sem_saida['Tempo_Setor_min'] = df_mov_sem_saida['Setor'].map(tempo_medio_setor)
+
+df_mov_sem_saida['Hora_Entrada_dt'] = pd.to_datetime(df_mov_sem_saida['Hora_Entrada'].astype(str))
+df_mov_sem_saida['Hora_Saida_dt'] = df_mov_sem_saida['Hora_Entrada_dt'] + pd.to_timedelta(df_mov_sem_saida['Tempo_Setor_min'], unit='m')
+
+# Concatenar movimentos com e sem saída
+df_mov_final = pd.concat([df_mov, df_mov_sem_saida], ignore_index=True)
+
+# Ajuste de formato de data se necessário
+df_mov_final['Data'] = pd.to_datetime(df_mov_final['Data'], errors='coerce')
+df_mov_final['Hora'] = df_mov_final['Hora_Entrada_dt'].dt.hour
+
+df_mov_final = df_mov_final.dropna(subset=['Data'])
+
+# --- CORRIGIR VIRADA DE DIA PARA TODOS OS REGISTROS ---
+df_mov_final.loc[df_mov_final['Hora_Saida_dt'] < df_mov_final['Hora_Entrada_dt'], 'Hora_Saida_dt'] += pd.Timedelta(days=1)
+
+# Atualizar o tempo de voo após correção
+df_mov_final['Tempo_Setor_min'] = (df_mov_final['Hora_Saida_dt'] - df_mov_final['Hora_Entrada_dt']).dt.total_seconds() / 60
+
+# --- NOVA LÓGICA DE CÁLCULOS ---
+
+# Contagem de movimentos por setor, hora e dia
+movimentos_diarios = df_mov_final.groupby(['Setor', 'Data', 'Hora']).size().reset_index(name='Movimentos')
+
+# Cálculo da média de movimentos por setor e hora
+media_movimentos = movimentos_diarios.groupby(['Setor', 'Hora'])['Movimentos'].mean().reset_index()
+
+# Calcular utilização percentual
+media_movimentos['Capacidade_Horaria'] = media_movimentos['Setor'].map(capacidades)
+media_movimentos['Utilizacao_%'] = (media_movimentos['Movimentos'] / media_movimentos['Capacidade_Horaria']) * 100
+
+# --- GRÁFICOS ---
+
+for setor in setores_validos:
+    tabela_setor = media_movimentos[media_movimentos['Setor'] == setor]
+    if not tabela_setor.empty:
+        fig, ax = plt.subplots(figsize=(10,6))
+        ax.bar(tabela_setor['Hora'], tabela_setor['Utilizacao_%'], color='skyblue')
+        ax.set_xlabel('Hora do dia')
+        ax.set_ylabel('Utilização da Capacidade (%)', color='blue')
+        max_y = tabela_setor['Utilizacao_%'].max()
+        ax.set_ylim(0, max_y * 1.2)
+        plt.title(f'Setor {setor} - Média de Utilização Horária')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+# Gráfico geral de densidade por setor
+densidade_setor = df_mov_final.groupby('Setor')['Tempo_Setor_min'].sum() / 60
+fig, ax = plt.subplots(figsize=(12,6))
+densidade_setor = densidade_setor.loc[setores_validos]
+ax.bar(densidade_setor.index, densidade_setor.values, color='seagreen')
+ax.set_xlabel('Setores')
+ax.set_ylabel('Horas de Voo no Período')
+ax.set_title('Densidade de Horas de Voo por Setor')
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
