@@ -1,0 +1,96 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tqdm import tqdm
+import time
+
+# --- CONFIGURAÇÕES INICIAIS ---
+caminho_esperas = r'C:\Python\Esperas_01_11_2024 00_00_31_03_2025 23_55.csv'
+caminho_movimentos = r'C:\Python\MOV_TMA-SP_2024_11_01_2025_03_31.csv'
+
+# --- CARREGAR ARQUIVOS ---
+print("Carregando dados de esperas...")
+for _ in tqdm(range(3), desc="Lendo esperas"):
+    time.sleep(0.3)
+df_esperas = pd.read_csv(caminho_esperas, encoding='utf-8')
+
+print("Carregando dados de movimentos...")
+for _ in tqdm(range(3), desc="Lendo movimentos"):
+    time.sleep(0.3)
+df_mov = pd.read_csv(caminho_movimentos, encoding='utf-8')
+
+# Corrigir as colunas de Esperas
+colunas_esperas = [
+    'Indicativo', 'ADEP', 'ADES', 'ADES PLAN',
+    'Data Hora Pouso', 'SIBT', 'Data Hora Espera',
+    'Duração', 'FL', 'lat', 'lon', 'setor'
+]
+df_esperas.columns = colunas_esperas
+
+# --- PRÉ-PROCESSAMENTO ---
+
+# Esperas
+df_esperas['Data Hora Espera'] = pd.to_datetime(df_esperas['Data Hora Espera'], errors='coerce')
+df_esperas['AnoSemana_Espera'] = df_esperas['Data Hora Espera'].dt.to_period('W')
+
+def converter_para_minutos(valor):
+    try:
+        h, m, s = map(int, valor.split(':'))
+        return h * 60 + m + s / 60
+    except:
+        return None
+
+df_esperas['Duracao_min'] = df_esperas['Duração'].apply(converter_para_minutos)
+
+# Movimentos
+df_mov['DATAREAL'] = pd.to_datetime(df_mov['DATAREAL'], errors='coerce')
+df_mov['AnoSemana_Mov'] = df_mov['DATAREAL'].dt.to_period('W')
+
+# --- CÁLCULOS SEMANAIS ---
+
+esperas_semana = df_esperas.groupby('AnoSemana_Espera').size()
+duracao_media_semana = df_esperas.groupby('AnoSemana_Espera')['Duracao_min'].mean()
+movimentos_semana = df_mov.groupby('AnoSemana_Mov').size()
+
+# --- UNIR OS DADOS ---
+
+df_semana = pd.DataFrame({
+    'Movimentos': movimentos_semana,
+    'Esperas': esperas_semana,
+    'Duracao_Espera': duracao_media_semana
+}).fillna(0)
+
+# --- NORMALIZAR CADA VARIÁVEL INDEPENDENTEMENTE ---
+
+scaler = MinMaxScaler()
+
+df_normalizado = df_semana.copy()
+
+for coluna in df_normalizado.columns:
+    df_normalizado[coluna] = scaler.fit_transform(df_normalizado[[coluna]])
+
+# --- GRÁFICO FINAL ---
+
+print("Gerando gráfico normalizado corretamente...")
+
+fig, ax = plt.subplots(figsize=(16,8))
+
+bar_width = 0.3
+index = range(len(df_semana))
+
+# Barras agrupadas
+ax.bar([i - bar_width for i in index], df_normalizado['Movimentos'], width=bar_width, label='Movimentos (normalizado)', color='steelblue')
+ax.bar([i for i in index], df_normalizado['Esperas'], width=bar_width, label='Esperas (normalizado)', color='darkorange')
+
+# Linha de duração
+ax.plot(index, df_normalizado['Duracao_Espera'], color='firebrick', marker='o', label='Duração Média Espera (normalizado)')
+
+ax.set_ylabel('Valores Normalizados')
+ax.set_xlabel('Semana')
+ax.set_title('Movimentos, Esperas e Duração Média das Esperas (Normalizados) por Semana')
+ax.set_xticks(index)
+ax.set_xticklabels(df_semana.index.astype(str), rotation=90)
+ax.grid(False)
+ax.legend()
+plt.tight_layout()
+plt.show()
