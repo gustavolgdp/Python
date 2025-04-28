@@ -141,3 +141,16 @@ ax.set_title('Densidade de Horas de Voo por Setor')
 plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
+
+# --- TABELA SOLICITADA: MÉDIA DE UTILIZAÇÃO ENTRE 08h00 E 02h00 ---
+
+# Selecionar apenas as horas desejadas
+horas_validas = list(range(8, 24)) + list(range(0, 3))
+
+filtro = media_movimentos[media_movimentos['Hora'].isin(horas_validas)]
+
+tabela_utilizacao = filtro.groupby('Setor')['Utilizacao_%'].mean().reset_index()
+tabela_utilizacao = tabela_utilizacao.rename(columns={'Utilizacao_%': 'Media_Utilizacao_08h_02h'})
+
+print("\nTabela de Média de Utilização entre 08h00 e 02h00:")
+print(tabela_utilizacao)
