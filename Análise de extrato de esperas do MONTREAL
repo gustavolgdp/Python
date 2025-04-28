@@ -1,0 +1,164 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import matplotlib.dates as mdates
+import time
+
+# --- CONFIGURAÇÕES INICIAIS ---
+caminho_csv = r'C:\Python\Esperas_01_11_2024 00_00_31_03_2025 23_55.csv'
+
+# --- CARREGAR DADOS ---
+print("Carregando dados...")
+for _ in tqdm(range(3), desc="Lendo o arquivo"):
+    time.sleep(0.3)
+
+df = pd.read_csv(caminho_csv, encoding='utf-8')
+
+# Corrigir as colunas conforme informado
+colunas_esperadas = [
+    'Indicativo', 'ADEP', 'ADES', 'ADES PLAN',
+    'Data Hora Pouso', 'SIBT', 'Data Hora Espera',
+    'Duração', 'FL', 'lat', 'lon', 'setor'
+]
+df.columns = colunas_esperadas
+
+# Converter colunas de data
+for _ in tqdm(range(3), desc="Convertendo datas"):
+    time.sleep(0.3)
+
+df['Data Hora Pouso'] = pd.to_datetime(df['Data Hora Pouso'], errors='coerce')
+df['Data Hora Espera'] = pd.to_datetime(df['Data Hora Espera'], errors='coerce')
+
+# --- CONVERTER DURAÇÃO ---
+print("Convertendo duração para minutos...")
+for _ in tqdm(range(3), desc="Convertendo duração"):
+    time.sleep(0.3)
+
+def converter_para_minutos(valor):
+    try:
+        h, m, s = map(int, valor.split(':'))
+        return h * 60 + m + s / 60
+    except:
+        return None
+
+df['Duracao_min'] = df['Duração'].apply(converter_para_minutos)
+
+# Criar colunas auxiliares
+df['Data_Espera'] = df['Data Hora Espera'].dt.date
+df['AnoMes_Espera'] = df['Data Hora Espera'].dt.to_period('M')
+df['AnoSemana_Espera'] = df['Data Hora Espera'].dt.to_period('W')
+
+# --- GRÁFICOS ---
+
+# 1. Gráfico de número de esperas totais
+print("Gerando gráfico de número de esperas totais...")
+fig, ax = plt.subplots(figsize=(8,5))
+total_esperas = len(df)
+ax.bar(['Total de Esperas'], [total_esperas], color='cornflowerblue')
+ax.set_ylabel('Número de Esperas')
+ax.set_title('Total de Esperas no Período')
+ax.grid(False)
+# Adicionar rótulo
+ax.text(0, total_esperas + 2, str(total_esperas), ha='center', va='bottom', fontsize=8)
+plt.tight_layout()
+plt.show()
+
+# Imprimir no console também
+print(f"\n📊 Número total de esperas no período: {total_esperas}")
+
+# 2. Gráfico de número de esperas por mês
+print("Gerando gráfico de esperas por mês...")
+esperas_mes = df.groupby('AnoMes_Espera').size()
+
+fig, ax = plt.subplots(figsize=(12,6))
+esperas_mes.plot(kind='bar', color='teal', ax=ax)
+ax.set_ylabel('Número de Esperas')
+ax.set_title('Número de Esperas por Mês')
+ax.grid(False)
+for idx, value in enumerate(esperas_mes.values):
+    ax.text(idx, value + 2, str(int(value)), ha='center', va='bottom', fontsize=8)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# 3. Gráfico combinado: Número de esperas por semana + Duração média
+print("Gerando gráfico combinado de esperas e duração média por semana...")
+esperas_semana = df.groupby('AnoSemana_Espera').size()
+duracao_semana = df.groupby('AnoSemana_Espera')['Duracao_min'].mean()
+
+fig, ax1 = plt.subplots(figsize=(14,6))
+
+# Barras - Número de esperas
+ax1.bar(esperas_semana.index.astype(str), esperas_semana.values, color='mediumslateblue')
+ax1.set_ylabel('Número de Esperas', color='mediumslateblue')
+ax1.tick_params(axis='y', labelcolor='mediumslateblue')
+ax1.set_title('Número de Esperas e Duração Média por Semana')
+ax1.grid(False)
+for idx, value in enumerate(esperas_semana.values):
+    ax1.text(idx, value + 2, str(int(value)), ha='center', va='bottom', fontsize=8)
+
+# Linha - Duração média
+ax2 = ax1.twinx()
+ax2.plot(duracao_semana.index.astype(str), duracao_semana.values, color='firebrick', marker='o', linestyle='-')
+ax2.set_ylabel('Duração Média (min)', color='firebrick')
+ax2.tick_params(axis='y', labelcolor='firebrick')
+
+fig.autofmt_xdate(rotation=90)
+plt.tight_layout()
+plt.show()
+
+# 4. Gráfico de número de esperas por dia (sem zeros)
+print("Gerando gráfico de esperas por dia...")
+esperas_dia = df.groupby('Data_Espera').size()
+esperas_dia = esperas_dia[esperas_dia > 0]
+
+fig, ax = plt.subplots(figsize=(14,6))
+esperas_dia.plot(marker='o', linestyle='-', ax=ax)
+ax.set_ylabel('Número de Esperas')
+ax.set_title('Número de Esperas por Dia (sem zeros)')
+ax.xaxis.set_major_locator(mdates.MonthLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%Y'))
+ax.grid(False)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# 5. Distribuição do número de esperas por faixa de nível de voo
+print("Gerando distribuição por FL...")
+bins = [100, 150, 200, 250]
+labels = ['FL100-150', 'FL151-200', 'FL201-250']
+df['Faixa_FL'] = pd.cut(df['FL'], bins=bins, labels=labels, include_lowest=True)
+
+distribuicao_fl = df['Faixa_FL'].value_counts().sort_index()
+
+fig, ax = plt.subplots(figsize=(8,5))
+distribuicao_fl.plot(kind='bar', color='darkorange', ax=ax)
+ax.set_ylabel('Número de Esperas')
+ax.set_title('Distribuição de Esperas por Faixas de Nível de Voo (FL)')
+ax.grid(False)
+for idx, value in enumerate(distribuicao_fl.values):
+    ax.text(idx, value + 2, str(int(value)), ha='center', va='bottom', fontsize=8)
+plt.tight_layout()
+plt.show()
+
+# 6. Gráfico de duração média das esperas por mês
+print("Gerando gráfico de duração média das esperas por mês...")
+duracao_mes = df.groupby('AnoMes_Espera')['Duracao_min'].mean()
+
+fig, ax = plt.subplots(figsize=(12,6))
+duracao_mes.plot(marker='o', linestyle='-', color='seagreen', ax=ax)
+ax.set_ylabel('Duração Média (min)')
+ax.set_title('Duração Média das Esperas por Mês')
+ax.grid(False)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# 7. Tempo médio geral de espera
+print("Calculando tempo médio de espera...")
+for _ in tqdm(range(3), desc="Calculando tempo médio"):
+    time.sleep(0.3)
+
+tempo_medio = df['Duracao_min'].mean()
+
+print(f"\n⏱️ Tempo médio de espera: {tempo_medio:.2f} minutos")
