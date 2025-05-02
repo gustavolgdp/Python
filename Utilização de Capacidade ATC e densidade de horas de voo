@@ -89,26 +89,19 @@ df_mov_final['Hora'] = df_mov_final['Hora_Entrada_dt'].dt.hour
 
 df_mov_final = df_mov_final.dropna(subset=['Data'])
 
-# --- CORRIGIR VIRADA DE DIA PARA TODOS OS REGISTROS ---
+# --- CORRIGIR VIRADA de DIA ---
 df_mov_final.loc[df_mov_final['Hora_Saida_dt'] < df_mov_final['Hora_Entrada_dt'], 'Hora_Saida_dt'] += pd.Timedelta(days=1)
 
-# Atualizar o tempo de voo após correção
+# Recalcular o tempo
 df_mov_final['Tempo_Setor_min'] = (df_mov_final['Hora_Saida_dt'] - df_mov_final['Hora_Entrada_dt']).dt.total_seconds() / 60
 
-# --- NOVA LÓGICA DE CÁLCULOS ---
-
-# Contagem de movimentos por setor, hora e dia
+# --- CÁLCULOS ---
 movimentos_diarios = df_mov_final.groupby(['Setor', 'Data', 'Hora']).size().reset_index(name='Movimentos')
-
-# Cálculo da média de movimentos por setor e hora
 media_movimentos = movimentos_diarios.groupby(['Setor', 'Hora'])['Movimentos'].mean().reset_index()
-
-# Calcular utilização percentual
 media_movimentos['Capacidade_Horaria'] = media_movimentos['Setor'].map(capacidades)
 media_movimentos['Utilizacao_%'] = (media_movimentos['Movimentos'] / media_movimentos['Capacidade_Horaria']) * 100
 
 # --- GRÁFICOS ---
-
 for setor in setores_validos:
     tabela_setor = media_movimentos[media_movimentos['Setor'] == setor]
     if not tabela_setor.empty:
@@ -135,7 +128,7 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# --- GRÁFICO DE TEMPO MÉDIO DE PERMANÊNCIA POR SETOR ---
+# Gráfico tempo médio por setor
 tempo_medio_plot = df_mov_final.groupby('Setor')['Tempo_Setor_min'].mean().reindex(setores_validos).fillna(0)
 plt.figure(figsize=(12,6))
 tempo_medio_plot.plot(kind='bar', color='steelblue')
@@ -146,8 +139,7 @@ plt.grid(axis='y', linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
 
-# --- TABELA SOLICITADA: MÉDIA DE UTILIZAÇÃO ENTRE 08h00 E 02h00 ---
-
+# --- TABELAS SOLICITADAS ---
 horas_validas = list(range(8, 24)) + list(range(0, 3))
 filtro = media_movimentos[media_movimentos['Hora'].isin(horas_validas)]
 tabela_utilizacao = filtro.groupby('Setor')['Utilizacao_%'].mean().reset_index()
@@ -156,3 +148,7 @@ tabela_utilizacao = tabela_utilizacao.rename(columns={'Utilizacao_%': 'Media_Uti
 print("\nTabela de Média de Utilização entre 08h00 e 02h00:")
 print(tabela_utilizacao)
 
+# Nova tabela com tempos médios de permanência
+print("\nTempo Médio de Permanência por Setor (minutos):")
+tempo_medio_tabela = df_mov_final.groupby('Setor')['Tempo_Setor_min'].mean().reindex(setores_validos).fillna(0).reset_index()
+print(tempo_medio_tabela)
