@@ -5,26 +5,20 @@ from tqdm import tqdm
 from datetime import datetime, timedelta
 
 # --- CONFIGURAÇÕES INICIAIS ---
+caminho_csv = r'C:\Python\MOV_TMA-SP_2025_03_21_2025_03_31.csv'
 
-# Arquivo CSV
-caminho_csv = r'C:\\Python\\MOV_TMA-SP_2025_03_21_2025_03_31.csv'
-
-# Capacidades horárias corretas dos setores
 capacidades = {
     'T1': 48, 'T2': 47, 'T3': 45, 'T4': 41, 'T5': 45, 'T6': 50,
     'T7': 47, 'T8': 45, 'T9': 37, 'T10': 35, 'T11': 35, 'T12': 45,
     'T13': 45, 'VFR': 35
 }
 
-# Setores considerados
 setores_validos = list(capacidades.keys())
 
 # --- CARREGAMENTO DOS DADOS ---
-
 df = pd.read_csv(caminho_csv)
 
 # --- PRÉ-PROCESSAMENTO ---
-
 def organizar_movimentos(df):
     registros = []
     registros_sem_saida = []
@@ -71,7 +65,6 @@ def organizar_movimentos(df):
 df_mov, df_mov_sem_saida = organizar_movimentos(df)
 
 # Converter Hora_Entrada e Hora_Saida para datetime
-
 df_mov['Hora_Entrada_dt'] = pd.to_datetime(df_mov['Hora_Entrada'].astype(str))
 df_mov['Hora_Saida_dt'] = pd.to_datetime(df_mov['Hora_Saida'].astype(str))
 
@@ -142,15 +135,24 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
+# --- GRÁFICO DE TEMPO MÉDIO DE PERMANÊNCIA POR SETOR ---
+tempo_medio_plot = df_mov_final.groupby('Setor')['Tempo_Setor_min'].mean().reindex(setores_validos).fillna(0)
+plt.figure(figsize=(12,6))
+tempo_medio_plot.plot(kind='bar', color='steelblue')
+plt.title("Tempo Médio de Permanência por Setor (minutos)")
+plt.ylabel("Minutos")
+plt.xlabel("Setor")
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
 # --- TABELA SOLICITADA: MÉDIA DE UTILIZAÇÃO ENTRE 08h00 E 02h00 ---
 
-# Selecionar apenas as horas desejadas
 horas_validas = list(range(8, 24)) + list(range(0, 3))
-
 filtro = media_movimentos[media_movimentos['Hora'].isin(horas_validas)]
-
 tabela_utilizacao = filtro.groupby('Setor')['Utilizacao_%'].mean().reset_index()
 tabela_utilizacao = tabela_utilizacao.rename(columns={'Utilizacao_%': 'Media_Utilizacao_08h_02h'})
 
 print("\nTabela de Média de Utilização entre 08h00 e 02h00:")
 print(tabela_utilizacao)
+
