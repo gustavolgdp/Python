@@ -1,0 +1,71 @@
+import re
+from datetime import datetime
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# Caminho do arquivo local
+file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"
+
+# Leitura do arquivo
+with open(file_path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+# Regex para identificar data e dias
+data_regex = re.compile(r'^(\d{2}/\d{2}/\d{4}) \d{2}:\d{2} -')
+dias_regex = re.compile(r'(\d+)\s+dia[s]?\b', re.IGNORECASE)
+
+registros = []
+
+print("🔍 Processando dispensas médicas...")
+for line in tqdm(lines, desc="Analisando linhas"):
+    data_match = data_regex.search(line)
+    dias_match = dias_regex.search(line)
+    if data_match and dias_match:
+        data_str = data_match.group(1)
+        try:
+            data = datetime.strptime(data_str, "%d/%m/%Y")
+            dias = int(dias_match.group(1))
+            registros.append((data, dias))
+        except ValueError:
+            continue
+
+# Criar DataFrame
+df = pd.DataFrame(registros, columns=["data", "dias"])
+
+# Filtrar apenas entre 1º de fevereiro e 30 de abril de 2024
+inicio = datetime(2024, 2, 1)
+fim = datetime(2024, 4, 30)
+df = df[(df["data"] >= inicio) & (df["data"] <= fim)]
+
+# Criar colunas de período
+df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
+df["mes"] = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
+
+# Agrupar e somar
+por_semana = df.groupby("semana")["dias"].sum().reset_index()
+por_mes = df.groupby("mes")["dias"].sum().reset_index()
+
+# Gráfico de área por semana
+plt.figure(figsize=(12, 5))
+plt.plot(por_semana["semana"], por_semana["dias"], marker='o', color='blue')
+plt.fill_between(por_semana["semana"], por_semana["dias"], color='lightblue')
+plt.title("Dias de Dispensa Médica por Semana (fev a abr/2024)")
+plt.xlabel("Semana")
+plt.ylabel("Total de Dias")
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# Gráfico de área por mês
+plt.figure(figsize=(10, 5))
+plt.plot(por_mes["mes"], por_mes["dias"], marker='o', color='green')
+plt.fill_between(por_mes["mes"], por_mes["dias"], color='lightgreen')
+plt.title("Dias de Dispensa Médica por Mês (fev a abr/2024)")
+plt.xlabel("Mês")
+plt.ylabel("Total de Dias")
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
