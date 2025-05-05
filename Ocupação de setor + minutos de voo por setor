@@ -1,0 +1,102 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import re
+
+# Carregar CSV
+df = pd.read_csv(r'C:\Python\MOV_TMA-SP_2024_11_01_2025_03_31.csv', sep=',', encoding='utf-8')
+df['DATAREAL'] = pd.to_datetime(df['DATAREAL'].str[:10])
+df['DIA_SEMANA'] = df['DATAREAL'].dt.dayofweek
+
+# Validador de horário
+def horario_valido(horario):
+    return isinstance(horario, str) and re.match(r'^\d{2}:\d{2}:\d{2}$', horario)
+
+# 1. EXPANSÃO PARA OCUPAÇÃO (minuto a minuto)
+def expandir_setores(df):
+    setores = ['S1', 'S2', 'S3', 'S4']
+    horarios_entrada = ['H1C', 'H2C', 'H3C', 'H4C']
+    horarios_saida = ['H2C', 'H3C', 'H4C', None]
+    registros = []
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Expandindo setores (ocupação)"):
+        for i in range(4):
+            setor = row[setores[i]]
+            if pd.isna(setor):
+                continue
+            entrada = row[horarios_entrada[i]]
+            saida = row[horarios_saida[i]] if horarios_saida[i] else None
+            if not horario_valido(entrada) or (saida is not None and not horario_valido(saida)):
+                continue
+            try:
+                h_entrada = pd.to_datetime(f"{row['DATAREAL'].date()} {entrada}")
+                h_saida = pd.to_datetime(f"{row['DATAREAL'].date()} {saida}") if saida else h_entrada + pd.Timedelta(minutes=15)
+                minutos = pd.date_range(h_entrada, h_saida, freq='T')
+                for minuto in minutos:
+                    registros.append({
+                        'DIA_SEMANA': row['DIA_SEMANA'],
+                        'SETOR': setor,
+                        'MINUTO': minuto
+                    })
+            except:
+                continue
+    return pd.DataFrame(registros)
+
+df_ocup = expandir_setores(df)
+df_ocup['HORA'] = df_ocup['MINUTO'].dt.floor('H')
+grupo_ocup = df_ocup.groupby(['DIA_SEMANA', 'SETOR', 'HORA']).size().reset_index(name='OCUPACAO')
+media_ocup = grupo_ocup.groupby(['DIA_SEMANA', 'SETOR', 'HORA'])['OCUPACAO'].mean().reset_index()
+
+# 2. EXTRAÇÃO DE ENTRADAS
+def extrair_entradas(df):
+    setores = ['S1', 'S2', 'S3', 'S4']
+    horarios = ['H1C', 'H2C', 'H3C', 'H4C']
+    registros = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Extraindo entradas"):
+        for s_col, h_col in zip(setores, horarios):
+            setor = row[s_col]
+            hora_str = row[h_col]
+            if pd.isna(setor) or not horario_valido(hora_str):
+                continue
+            try:
+                data_hora = pd.to_datetime(f"{row['DATAREAL'].date()} {hora_str}")
+                hora_cheia = data_hora.floor('H')
+                registros.append({
+                    'SETOR': setor,
+                    'HORA': hora_cheia,
+                    'DIA_SEMANA': row['DIA_SEMANA']
+                })
+            except:
+                continue
+    return pd.DataFrame(registros)
+
+df_ent = extrair_entradas(df)
+grupo_ent = df_ent.groupby(['DIA_SEMANA', 'SETOR', 'HORA']).size().reset_index(name='ENTRADAS')
+media_ent = grupo_ent.groupby(['DIA_SEMANA', 'SETOR', 'HORA'])['ENTRADAS'].mean().reset_index()
+
+# FUNÇÃO PARA PLOTAR HEATMAP
+def plotar_heatmap(dados, valor_coluna, dias_semana, titulo):
+    df_plot = dados[dados['DIA_SEMANA'].isin(dias_semana)].copy()
+    df_plot['HORA_STR'] = df_plot['HORA'].dt.strftime('%H:%M')
+    heatmap_data = df_plot.pivot_table(index='HORA_STR', columns='SETOR', values=valor_coluna, fill_value=0)
+    heatmap_data = heatmap_data.sort_index()
+    heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
+    plt.figure(figsize=(14, 10))
+    sns.heatmap(heatmap_data, cmap='YlOrRd', linewidths=0.5, linecolor='gray', annot=True, fmt=".0f")
+    plt.title(titulo)
+    plt.xlabel('Setor')
+    plt.ylabel('Horário')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# HEATMAPS DE OCUPAÇÃO
+plotar_heatmap(media_ocup, 'OCUPACAO', list(range(0, 5)), "OCUPAÇÃO - Dias Úteis (minutos por hora)")
+plotar_heatmap(media_ocup, 'OCUPACAO', [5], "OCUPAÇÃO - Sábados (minutos por hora)")
+plotar_heatmap(media_ocup, 'OCUPACAO', [6], "OCUPAÇÃO - Domingos (minutos por hora)")
+
+# HEATMAPS DE ENTRADAS
+plotar_heatmap(media_ent, 'ENTRADAS', list(range(0, 5)), "ENTRADAS - Dias Úteis (aeronaves por hora)")
+plotar_heatmap(media_ent, 'ENTRADAS', [5], "ENTRADAS - Sábados (aeronaves por hora)")
+plotar_heatmap(media_ent, 'ENTRADAS', [6], "ENTRADAS - Domingos (aeronaves por hora)")
