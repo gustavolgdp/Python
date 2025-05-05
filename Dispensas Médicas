@@ -1,0 +1,100 @@
+import re
+from datetime import datetime
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# Caminho do arquivo
+file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"
+
+# Leitura do arquivo
+with open(file_path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+# Regex para nome + dias (ex: 3S Nome: 2 dias)
+linha_completa_regex = re.compile(
+    r'\b(1S|2S|3S)\s+([\w\s\.\-Á-Úá-úçÇ]+?)\s*[:\-–]?\s*(\d+)\s+dia[s]?\b',
+    re.IGNORECASE
+)
+data_regex = re.compile(r'^(\d{2}/\d{2}/\d{4}) \d{2}:\d{2} -')
+
+# Processar registros
+registros = []
+
+print("🔍 Processando dispensas por pessoa...")
+for line in tqdm(lines, desc="Analisando linhas"):
+    data_match = data_regex.search(line)
+    match = linha_completa_regex.search(line)
+    if data_match and match:
+        data_str = data_match.group(1)
+        try:
+            data = datetime.strptime(data_str, "%d/%m/%Y")
+            graduacao = match.group(1).upper()
+            nome = match.group(2).strip().title()
+            dias = int(match.group(3))
+            identificador = f"{graduacao} {nome}"
+            if identificador.lower() == "1s solange":
+                continue
+            registros.append((data, identificador, dias))
+        except ValueError:
+            continue
+
+# Criar DataFrame
+df = pd.DataFrame(registros, columns=["data", "pessoa", "dias"])
+df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
+df["mes"] = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
+
+# Agrupamentos
+por_pessoa = df.groupby("pessoa")["dias"].sum().sort_values(ascending=True)
+por_semana = df.groupby("semana")["dias"].sum().reset_index()
+por_mes = df.groupby("mes")["dias"].sum().reset_index()
+media_semana = por_semana["dias"].mean()
+media_mes = por_mes["dias"].mean()
+
+# Gráfico por pessoa
+plt.figure(figsize=(10, max(6, len(por_pessoa) * 0.3)))
+bars = plt.barh(por_pessoa.index, por_pessoa.values, color='skyblue')
+for bar in bars:
+    largura = bar.get_width()
+    plt.text(largura + 0.5, bar.get_y() + bar.get_height() / 2,
+             f'{int(largura)}', va='center', fontsize=9)
+plt.title("Total de Dias de Dispensa Médica por Pessoa (exceto 1S Solange)")
+plt.xlabel("Dias de Dispensa")
+plt.ylabel("Pessoa")
+plt.tight_layout()
+plt.grid(axis='x', linestyle='--', alpha=0.6)
+plt.show()
+
+# Gráfico por semana
+plt.figure(figsize=(12, 5))
+plt.plot(por_semana["semana"], por_semana["dias"], marker='o', color='blue')
+plt.fill_between(por_semana["semana"], por_semana["dias"], color='lightblue')
+plt.title("Dias de Dispensa Médica por Semana")
+plt.xlabel("Semana")
+plt.ylabel("Total de Dias")
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Gráfico por mês
+plt.figure(figsize=(10, 5))
+plt.plot(por_mes["mes"], por_mes["dias"], marker='o', color='green')
+plt.fill_between(por_mes["mes"], por_mes["dias"], color='lightgreen')
+plt.title("Dias de Dispensa Médica por Mês")
+plt.xlabel("Mês")
+plt.ylabel("Total de Dias")
+plt.xticks(rotation=45)
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# Exibir tabelas e médias
+print("\n=== Dias de Dispensa por Semana ===")
+print(por_semana.to_string(index=False))
+
+print("\n=== Dias de Dispensa por Mês ===")
+print(por_mes.to_string(index=False))
+
+print(f"\nMédia semanal: {media_semana:.2f} dias")
+print(f"Média mensal: {media_mes:.2f} dias")
