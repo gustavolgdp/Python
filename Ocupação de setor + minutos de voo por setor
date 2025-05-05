@@ -4,16 +4,19 @@ import seaborn as sns
 from tqdm import tqdm
 import re
 
+# Nome do arquivo CSV
+nome_arquivo = 'MOV_TMA-SP_2024_11_01_2025_03_31.csv'
+
 # Carregar CSV
-df = pd.read_csv(r'C:\Python\MOV_TMA-SP_2024_11_01_2025_03_31.csv', sep=',', encoding='utf-8')
+df = pd.read_csv(rf'C:\Python\{nome_arquivo}', sep=',', encoding='utf-8')
 df['DATAREAL'] = pd.to_datetime(df['DATAREAL'].str[:10])
 df['DIA_SEMANA'] = df['DATAREAL'].dt.dayofweek
 
-# Validador de horário
+# Verifica se o horário está no formato HH:MM:SS
 def horario_valido(horario):
     return isinstance(horario, str) and re.match(r'^\d{2}:\d{2}:\d{2}$', horario)
 
-# Função auxiliar: normalizar nome do setor
+# Normaliza nomes dos setores
 def normalizar_setor(s):
     if pd.isna(s):
         return None
@@ -88,13 +91,23 @@ df_ent = extrair_entradas(df)
 grupo_ent = df_ent.groupby(['DIA_SEMANA', 'SETOR', 'HORA']).size().reset_index(name='ENTRADAS')
 media_ent = grupo_ent.groupby(['DIA_SEMANA', 'SETOR', 'HORA'])['ENTRADAS'].mean().reset_index()
 
-# FUNÇÃO PARA PLOTAR HEATMAP
-def plotar_heatmap(dados, valor_coluna, dias_semana, titulo):
+# Função auxiliar: ordena setores numericamente (T1, T2, ..., T14)
+def ordenar_setores(colunas):
+    def extrai_num(s):
+        try:
+            return int(re.search(r'\d+', s).group())
+        except:
+            return float('inf')
+    return sorted(colunas, key=extrai_num)
+
+# FUNÇÃO PARA PLOTAR HEATMAP COM NOME DO ARQUIVO E SETORES ORDENADOS
+def plotar_heatmap(dados, valor_coluna, dias_semana, titulo, nome_arquivo):
     df_plot = dados[dados['DIA_SEMANA'].isin(dias_semana)].copy()
     df_plot['HORA_STR'] = df_plot['HORA'].dt.strftime('%H:%M')
     heatmap_data = df_plot.pivot_table(index='HORA_STR', columns='SETOR', values=valor_coluna, fill_value=0)
     heatmap_data = heatmap_data.sort_index()
-    heatmap_data = heatmap_data.reindex(sorted(heatmap_data.columns), axis=1)
+    heatmap_data = heatmap_data.reindex(ordenar_setores(heatmap_data.columns), axis=1)
+
     plt.figure(figsize=(14, 10))
     sns.heatmap(heatmap_data, cmap='YlOrRd', linewidths=0.5, linecolor='gray', annot=True, fmt=".0f")
     plt.title(titulo)
@@ -102,14 +115,17 @@ def plotar_heatmap(dados, valor_coluna, dias_semana, titulo):
     plt.ylabel('Horário')
     plt.xticks(rotation=45)
     plt.tight_layout()
+
+    # Nome do arquivo no rodapé
+    plt.figtext(0.01, 0.01, f'Arquivo de origem: {nome_arquivo}', ha='left', fontsize=8, style='italic', color='gray')
     plt.show()
 
 # HEATMAPS DE OCUPAÇÃO
-plotar_heatmap(media_ocup, 'OCUPACAO', list(range(0, 5)), "OCUPAÇÃO - Dias Úteis (minutos por hora)")
-plotar_heatmap(media_ocup, 'OCUPACAO', [5], "OCUPAÇÃO - Sábados (minutos por hora)")
-plotar_heatmap(media_ocup, 'OCUPACAO', [6], "OCUPAÇÃO - Domingos (minutos por hora)")
+plotar_heatmap(media_ocup, 'OCUPACAO', list(range(0, 5)), "OCUPAÇÃO - Dias Úteis (minutos por hora)", nome_arquivo)
+plotar_heatmap(media_ocup, 'OCUPACAO', [5], "OCUPAÇÃO - Sábados (minutos por hora)", nome_arquivo)
+plotar_heatmap(media_ocup, 'OCUPACAO', [6], "OCUPAÇÃO - Domingos (minutos por hora)", nome_arquivo)
 
 # HEATMAPS DE ENTRADAS
-plotar_heatmap(media_ent, 'ENTRADAS', list(range(0, 5)), "ENTRADAS - Dias Úteis (aeronaves por hora)")
-plotar_heatmap(media_ent, 'ENTRADAS', [5], "ENTRADAS - Sábados (aeronaves por hora)")
-plotar_heatmap(media_ent, 'ENTRADAS', [6], "ENTRADAS - Domingos (aeronaves por hora)")
+plotar_heatmap(media_ent, 'ENTRADAS', list(range(0, 5)), "ENTRADAS - Dias Úteis (aeronaves por hora)", nome_arquivo)
+plotar_heatmap(media_ent, 'ENTRADAS', [5], "ENTRADAS - Sábados (aeronaves por hora)", nome_arquivo)
+plotar_heatmap(media_ent, 'ENTRADAS', [6], "ENTRADAS - Domingos (aeronaves por hora)", nome_arquivo)
