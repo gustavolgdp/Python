@@ -91,7 +91,12 @@ df_ent = extrair_entradas(df)
 grupo_ent = df_ent.groupby(['DIA_SEMANA', 'SETOR', 'HORA']).size().reset_index(name='ENTRADAS')
 media_ent = grupo_ent.groupby(['DIA_SEMANA', 'SETOR', 'HORA'])['ENTRADAS'].mean().reset_index()
 
-# Função auxiliar: ordena setores numericamente (T1, T2, ..., T14)
+# 3. CALCULAR TEMPO MÉDIO DE OCUPAÇÃO POR AERONAVE
+df_merged = pd.merge(media_ocup, media_ent, on=['DIA_SEMANA', 'SETOR', 'HORA'], how='inner')
+df_merged['OCUP_POR_AERONAVE'] = df_merged['OCUPACAO'] / df_merged['ENTRADAS']
+media_ocup_por_aeronave = df_merged[['DIA_SEMANA', 'SETOR', 'HORA', 'OCUP_POR_AERONAVE']].copy()
+
+# Função auxiliar: ordena setores numericamente
 def ordenar_setores(colunas):
     def extrai_num(s):
         try:
@@ -100,7 +105,7 @@ def ordenar_setores(colunas):
             return float('inf')
     return sorted(colunas, key=extrai_num)
 
-# FUNÇÃO PARA PLOTAR HEATMAP COM NOME DO ARQUIVO E SETORES ORDENADOS
+# Função para heatmap
 def plotar_heatmap(dados, valor_coluna, dias_semana, titulo, nome_arquivo):
     df_plot = dados[dados['DIA_SEMANA'].isin(dias_semana)].copy()
     df_plot['HORA_STR'] = df_plot['HORA'].dt.strftime('%H:%M')
@@ -109,23 +114,26 @@ def plotar_heatmap(dados, valor_coluna, dias_semana, titulo, nome_arquivo):
     heatmap_data = heatmap_data.reindex(ordenar_setores(heatmap_data.columns), axis=1)
 
     plt.figure(figsize=(14, 10))
-    sns.heatmap(heatmap_data, cmap='YlOrRd', linewidths=0.5, linecolor='gray', annot=True, fmt=".0f")
+    sns.heatmap(heatmap_data, cmap='YlOrRd', linewidths=0.5, linecolor='gray', annot=True, fmt=".1f")
     plt.title(titulo)
     plt.xlabel('Setor')
     plt.ylabel('Horário')
     plt.xticks(rotation=45)
     plt.tight_layout()
-
-    # Nome do arquivo no rodapé
     plt.figtext(0.01, 0.01, f'Arquivo de origem: {nome_arquivo}', ha='left', fontsize=8, style='italic', color='gray')
     plt.show()
 
-# HEATMAPS DE OCUPAÇÃO
+# 1. HEATMAPS DE OCUPAÇÃO
 plotar_heatmap(media_ocup, 'OCUPACAO', list(range(0, 5)), "OCUPAÇÃO - Dias Úteis (minutos por hora)", nome_arquivo)
 plotar_heatmap(media_ocup, 'OCUPACAO', [5], "OCUPAÇÃO - Sábados (minutos por hora)", nome_arquivo)
 plotar_heatmap(media_ocup, 'OCUPACAO', [6], "OCUPAÇÃO - Domingos (minutos por hora)", nome_arquivo)
 
-# HEATMAPS DE ENTRADAS
+# 2. HEATMAPS DE ENTRADAS
 plotar_heatmap(media_ent, 'ENTRADAS', list(range(0, 5)), "ENTRADAS - Dias Úteis (aeronaves por hora)", nome_arquivo)
 plotar_heatmap(media_ent, 'ENTRADAS', [5], "ENTRADAS - Sábados (aeronaves por hora)", nome_arquivo)
 plotar_heatmap(media_ent, 'ENTRADAS', [6], "ENTRADAS - Domingos (aeronaves por hora)", nome_arquivo)
+
+# 3. HEATMAPS DE TEMPO MÉDIO DE OCUPAÇÃO POR AERONAVE
+plotar_heatmap(media_ocup_por_aeronave, 'OCUP_POR_AERONAVE', list(range(0, 5)), "TEMPO MÉDIO - Dias Úteis (min/por aeronave)", nome_arquivo)
+plotar_heatmap(media_ocup_por_aeronave, 'OCUP_POR_AERONAVE', [5], "TEMPO MÉDIO - Sábados (min/por aeronave)", nome_arquivo)
+plotar_heatmap(media_ocup_por_aeronave, 'OCUP_POR_AERONAVE', [6], "TEMPO MÉDIO - Domingos (min/por aeronave)", nome_arquivo)
