@@ -1,0 +1,69 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+
+# Caminho do novo arquivo
+caminho_arquivo = r'C:\Python\SBGR_2025_04_01_2025_05_11.xlsx'
+
+print("Lendo o arquivo...")
+# Leitura do arquivo .xls
+df = pd.read_excel(caminho_arquivo)
+
+print("Convertendo coluna 'Pouso Real' para datetime UTC...")
+df['Pouso Real'] = pd.to_datetime(df['Pouso Real'], errors='coerce', utc=True)
+
+# Converter de UTC para horário local (UTC-3)
+df['Pouso Local'] = df['Pouso Real'] - pd.Timedelta(hours=3)
+
+# Filtrar apenas os dias 29 e 30 de maio de 2025 (horário local)
+datas_desejadas = [pd.Timestamp('2025-04-29'), pd.Timestamp('2025-04-30')]
+
+print("Filtrando dados dos dias 29 e 30 de maio de 2025...")
+df['Data Local'] = df['Pouso Local'].dt.date
+df_filtrado = df[df['Data Local'].isin([d.date() for d in datas_desejadas])].copy()
+
+# Criar uma coluna com a hora arredondada para baixo
+df_filtrado['Hora Local'] = df_filtrado['Pouso Local'].dt.floor('H')
+
+# Contagem de pousos por hora
+print("Agrupando pousos por hora...")
+pousos_por_hora = df_filtrado.groupby(['Data Local', 'Hora Local']).size().reset_index(name='Pousos')
+
+# Completar horas ausentes com zero
+print("Montando estrutura horária completa com barra de progresso...")
+resultados_finais = []
+
+for data in tqdm(datas_desejadas, desc='Processando dias'):
+    inicio = datetime.combine(data, datetime.min.time())
+    horas = pd.date_range(start=inicio, periods=24, freq='H')
+    df_base = pd.DataFrame({'Hora Local': horas})
+    df_base['Data Local'] = data.date()
+    resultado = pd.merge(df_base, pousos_por_hora, on=['Data Local', 'Hora Local'], how='left').fillna(0)
+    resultado['Pousos'] = resultado['Pousos'].astype(int)
+    resultados_finais.append(resultado)
+
+# Concatenar resultados
+df_resultado = pd.concat(resultados_finais).reset_index(drop=True)
+
+# Mostrar primeiros resultados
+print("\nResumo dos pousos por hora:")
+print(df_resultado.head(10))  # Mostra os 10 primeiros registros
+
+# (Opcional) Exportar para Excel
+# df_resultado.to_excel(r'C:\Python\pousos_por_hora.xlsx', index=False)
+
+# Plotar gráfico
+print("Gerando gráficos...")
+for data in datas_desejadas:
+    df_plot = df_resultado[df_resultado['Data Local'] == data.date()]
+    plt.figure(figsize=(12, 4))
+    plt.bar(df_plot['Hora Local'].dt.strftime('%H:%M'), df_plot['Pousos'])
+    plt.title(f'Quantidade de pousos por hora - {data.strftime("%d/%m/%Y")} (Horário Local)')
+    plt.xlabel('Hora Local')
+    plt.ylabel('Quantidade de Pousos')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+print("Processamento finalizado.")
