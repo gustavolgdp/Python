@@ -1,0 +1,68 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+
+# Caminho do arquivo
+caminho_arquivo = r'C:\Python\SBGR_2025_04_01_2025_05_11.xlsx'
+
+print("Lendo o arquivo...")
+# Leitura da planilha 'Report'
+df = pd.read_excel(caminho_arquivo, sheet_name='Report')
+
+print("Convertendo coluna 'Pouso Real' para datetime...")
+df['Pouso Real'] = pd.to_datetime(df['Pouso Real'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+df = df.dropna(subset=['Pouso Real'])
+
+# Considerando que o horário já está em UTC-3
+df['Pouso Local'] = df['Pouso Real']
+
+# Datas desejadas
+datas_desejadas = [pd.Timestamp('2025-04-29'), pd.Timestamp('2025-04-30')]
+
+print("Filtrando dados para os dias 29 e 30/04/2025...")
+df['Data Local'] = df['Pouso Local'].dt.date
+df_filtrado = df[df['Data Local'].isin([d.date() for d in datas_desejadas])].copy()
+
+df_filtrado['Hora Local'] = df_filtrado['Pouso Local'].dt.floor('H')
+
+print("Contando pousos por hora...")
+pousos_por_hora = df_filtrado.groupby(['Data Local', 'Hora Local']).size().reset_index(name='Pousos')
+
+print("Construindo estrutura horária completa com barra de progresso...")
+resultados_finais = []
+
+for data in tqdm(datas_desejadas, desc="Processando dias"):
+    inicio = datetime.combine(data, datetime.min.time())
+    horas = pd.date_range(start=inicio, periods=24, freq='H')
+    df_base = pd.DataFrame({'Hora Local': horas})
+    df_base['Data Local'] = data.date()
+    resultado = pd.merge(df_base, pousos_por_hora, on=['Data Local', 'Hora Local'], how='left').fillna(0)
+    resultado['Pousos'] = resultado['Pousos'].astype(int)
+    resultados_finais.append(resultado)
+
+df_resultado = pd.concat(resultados_finais).reset_index(drop=True)
+
+print("\nResumo dos pousos por hora:")
+print(df_resultado.head(10))
+
+# Gerar gráficos com rótulos de dados
+print("Gerando gráficos com rótulos...")
+for data in datas_desejadas:
+    df_plot = df_resultado[df_resultado['Data Local'] == data.date()]
+    plt.figure(figsize=(12, 4))
+    bars = plt.bar(df_plot['Hora Local'].dt.strftime('%H:%M'), df_plot['Pousos'])
+    
+    # Adicionando os rótulos sobre cada barra
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.1, str(yval), ha='center', va='bottom', fontsize=8)
+
+    plt.title(f'Quantidade de pousos por hora - {data.strftime("%d/%m/%Y")} (Horário Local)')
+    plt.xlabel('Hora Local')
+    plt.ylabel('Quantidade de Pousos')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+print("Processamento finalizado.")
