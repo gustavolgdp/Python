@@ -1,0 +1,79 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+
+# Caminho do arquivo
+caminho_arquivo = r'C:\Python\SBGR_2025_04_01_2025_05_11.xlsx'
+
+print("Lendo o arquivo...")
+df = pd.read_excel(caminho_arquivo, sheet_name='Report')
+
+print("Convertendo 'Pouso Real' para datetime...")
+df['Pouso Real'] = pd.to_datetime(df['Pouso Real'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+df = df.dropna(subset=['Pouso Real'])
+
+# Considerando que já está em horário local
+df['Pouso Local'] = df['Pouso Real']
+
+# Datas alvo
+datas_desejadas = [pd.Timestamp('2025-04-29'), pd.Timestamp('2025-04-30')]
+df['Data Local'] = df['Pouso Local'].dt.date
+
+# Filtrar somente pousos nas datas
+print("Filtrando dados para os dias 29 e 30/04/2025...")
+df_filtrado = df[df['Data Local'].isin([d.date() for d in datas_desejadas])].copy()
+
+# Excluir pistas indesejadas
+pistas_excluidas = ['10P', '28P']
+df_filtrado = df_filtrado[~df_filtrado['Pista'].isin(pistas_excluidas)]
+
+# Arredondar horário para hora cheia
+df_filtrado['Hora Local'] = df_filtrado['Pouso Local'].dt.floor('H')
+
+# Agrupar por data, hora e pista
+print("Contando pousos por pista e hora...")
+agrupado = df_filtrado.groupby(['Data Local', 'Hora Local', 'Pista']).size().reset_index(name='Pousos')
+
+# Estrutura final com todas as horas e pistas (para completar os zeros)
+print("Montando estrutura completa com barra de progresso...")
+resultados = []
+
+for data in tqdm(datas_desejadas, desc="Processando dias"):
+    inicio = datetime.combine(data, datetime.min.time())
+    horas = pd.date_range(start=inicio, periods=24, freq='H')
+    pistas_unicas = df_filtrado['Pista'].dropna().unique()
+    
+    for hora in horas:
+        for pista in pistas_unicas:
+            filtro = (
+                (agrupado['Data Local'] == data.date()) &
+                (agrupado['Hora Local'] == hora) &
+                (agrupado['Pista'] == pista)
+            )
+            count = agrupado.loc[filtro, 'Pousos'].sum() if not agrupado.loc[filtro].empty else 0
+            resultados.append({
+                'Data Local': data.date(),
+                'Hora Local': hora,
+                'Pista': pista,
+                'Pousos': count
+            })
+
+df_resultado = pd.DataFrame(resultados)
+
+# Gerar gráficos empilhados por dia
+print("Gerando gráficos por pista (empilhado)...")
+for data in datas_desejadas:
+    df_plot = df_resultado[df_resultado['Data Local'] == data.date()]
+    pivot = df_plot.pivot(index='Hora Local', columns='Pista', values='Pousos').fillna(0)
+
+    pivot.plot(kind='bar', stacked=True, figsize=(12, 5))
+    plt.title(f'Uso das pistas por hora - {data.strftime("%d/%m/%Y")} (Horário Local)')
+    plt.xlabel('Hora Local')
+    plt.ylabel('Quantidade de Pousos')
+    plt.xticks(rotation=45)
+    plt.legend(title='Pista')
+    plt.tight_layout()
+    plt.show()
+
+print("Processamento finalizado.")
