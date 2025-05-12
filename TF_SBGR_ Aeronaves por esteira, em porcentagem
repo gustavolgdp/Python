@@ -1,0 +1,87 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from datetime import datetime
+
+# Caminho do arquivo
+caminho_arquivo = r'C:\Python\SBGR_2025_04_01_2025_05_11.xlsx'
+
+print("Lendo o arquivo...")
+df = pd.read_excel(caminho_arquivo, sheet_name='Report')
+
+print("Convertendo 'Pouso Real' para datetime...")
+df['Pouso Real'] = pd.to_datetime(df['Pouso Real'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+df = df.dropna(subset=['Pouso Real'])
+
+df['Pouso Local'] = df['Pouso Real']
+
+# Datas alvo
+datas_desejadas = [pd.Timestamp('2025-04-29'), pd.Timestamp('2025-04-30')]
+df['Data Local'] = df['Pouso Local'].dt.date
+df_filtrado = df[df['Data Local'].isin([d.date() for d in datas_desejadas])].copy()
+
+df_filtrado['Hora Local'] = df_filtrado['Pouso Local'].dt.floor('H')
+df_filtrado = df_filtrado.dropna(subset=['Esteira de Turbulência'])
+
+# Agrupar
+print("Contando aeronaves por esteira e hora...")
+agrupado = df_filtrado.groupby(['Data Local', 'Hora Local', 'Esteira de Turbulência']).size().reset_index(name='Quantidade')
+
+# Montar estrutura completa
+print("Montando estrutura horária com barra de progresso...")
+resultados = []
+
+for data in tqdm(datas_desejadas, desc="Processando dias"):
+    inicio = datetime.combine(data, datetime.min.time())
+    horas = pd.date_range(start=inicio, periods=24, freq='H')
+    esteiras_unicas = df_filtrado['Esteira de Turbulência'].dropna().unique()
+    
+    for hora in horas:
+        for esteira in esteiras_unicas:
+            filtro = (
+                (agrupado['Data Local'] == data.date()) &
+                (agrupado['Hora Local'] == hora) &
+                (agrupado['Esteira de Turbulência'] == esteira)
+            )
+            count = agrupado.loc[filtro, 'Quantidade'].sum() if not agrupado.loc[filtro].empty else 0
+            resultados.append({
+                'Data Local': data.date(),
+                'Hora Local': hora,
+                'Esteira': esteira,
+                'Quantidade': count
+            })
+
+df_resultado = pd.DataFrame(resultados)
+
+# Gráficos com rótulos em porcentagem
+print("Gerando gráficos com rótulos em porcentagem...")
+for data in datas_desejadas:
+    df_plot = df_resultado[df_resultado['Data Local'] == data.date()]
+    pivot = df_plot.pivot(index='Hora Local', columns='Esteira', values='Quantidade').fillna(0)
+
+    # Calcular totais por hora
+    totais = pivot.sum(axis=1)
+    porcentagens = pivot.divide(totais, axis=0).fillna(0) * 100
+
+    ax = pivot.plot(kind='bar', stacked=True, figsize=(12, 5))
+    plt.title(f'Percentual de aeronaves por esteira - {data.strftime("%d/%m/%Y")} (Horário Local)')
+    plt.xlabel('Hora Local')
+    plt.ylabel('Quantidade de Aeronaves')
+    plt.xticks(rotation=45)
+    plt.legend(title='Esteira')
+    plt.tight_layout()
+
+    # Rótulos em porcentagem
+    for idx, hora in enumerate(pivot.index):
+        altura_acumulada = 0
+        for esteira in pivot.columns:
+            valor = pivot.loc[hora, esteira]
+            if valor > 0:
+                pct = porcentagens.loc[hora, esteira]
+                y = altura_acumulada + valor / 2
+                ax.text(idx, y, f'{pct:.0f}%', ha='center', va='center', fontsize=8, color='white', weight='bold')
+                altura_acumulada += valor
+
+    plt.show()
+
+print("Processamento finalizado.")
