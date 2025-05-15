@@ -11,46 +11,62 @@ file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.t
 with open(file_path, encoding='utf-8') as f:
     lines = f.readlines()
 
-# Regex para identificar data e dias
+# Regex para data, nome Solange e dias
 data_regex = re.compile(r'^(\d{2}/\d{2}/\d{4}) \d{2}:\d{2} -')
+linha_solange_regex = re.compile(r'\b(1S|2S|3S)\s+Solange\b', re.IGNORECASE)
 dias_regex = re.compile(r'(\d+)\s+dia[s]?\b', re.IGNORECASE)
 
 registros = []
 
-print("🔍 Processando dispensas médicas...")
+print("🔍 Processando dispensas entre 01/01 e 30/05/2025 (ignorando Solange)...")
 for line in tqdm(lines, desc="Analisando linhas"):
     data_match = data_regex.search(line)
-    dias_match = dias_regex.search(line)
-    if data_match and dias_match:
-        data_str = data_match.group(1)
+    if data_match:
         try:
-            data = datetime.strptime(data_str, "%d/%m/%Y")
-            dias = int(dias_match.group(1))
-            registros.append((data, dias))
+            data = datetime.strptime(data_match.group(1), "%d/%m/%Y")
+            if not (datetime(2025, 1, 1) <= data <= datetime(2025, 5, 30)):
+                continue
         except ValueError:
             continue
 
+        if linha_solange_regex.search(line):
+            continue
+
+        dias_match = dias_regex.search(line)
+        if dias_match:
+            try:
+                dias = int(dias_match.group(1))
+                registros.append((data, dias))
+            except ValueError:
+                continue
+
 # Criar DataFrame
 df = pd.DataFrame(registros, columns=["data", "dias"])
-
-# Filtrar apenas entre 1º de fevereiro e 30 de abril de 2024
-inicio = datetime(2024, 2, 1)
-fim = datetime(2024, 4, 30)
-df = df[(df["data"] >= inicio) & (df["data"] <= fim)]
-
-# Criar colunas de período
 df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
 df["mes"] = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
 
-# Agrupar e somar
+# Agrupamentos
+por_dia = df.groupby("data")["dias"].sum().reset_index()
 por_semana = df.groupby("semana")["dias"].sum().reset_index()
 por_mes = df.groupby("mes")["dias"].sum().reset_index()
 
-# Gráfico de área por semana
+# === Gráfico por dia ===
+plt.figure(figsize=(14, 5))
+plt.plot(por_dia["data"], por_dia["dias"], marker='o', color='purple')
+plt.fill_between(por_dia["data"], por_dia["dias"], color='violet', alpha=0.3)
+plt.title("Dias de Dispensa Médica por Dia (01/01 a 30/05/2025)")
+plt.xlabel("Data")
+plt.ylabel("Total de Dias")
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# === Gráfico por semana ===
 plt.figure(figsize=(12, 5))
-plt.plot(por_semana["semana"], por_semana["dias"], marker='o', color='blue')
-plt.fill_between(por_semana["semana"], por_semana["dias"], color='lightblue')
-plt.title("Dias de Dispensa Médica por Semana (fev a abr/2024)")
+plt.plot(por_semana["semana"].astype(str), por_semana["dias"], marker='o', color='blue')
+plt.fill_between(por_semana["semana"].astype(str), por_semana["dias"], color='lightblue')
+plt.title("Dias de Dispensa Médica por Semana (01/01 a 30/05/2025)")
 plt.xlabel("Semana")
 plt.ylabel("Total de Dias")
 plt.grid(True)
@@ -58,11 +74,11 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# Gráfico de área por mês
+# === Gráfico por mês ===
 plt.figure(figsize=(10, 5))
-plt.plot(por_mes["mes"], por_mes["dias"], marker='o', color='green')
-plt.fill_between(por_mes["mes"], por_mes["dias"], color='lightgreen')
-plt.title("Dias de Dispensa Médica por Mês (fev a abr/2024)")
+plt.plot(por_mes["mes"].astype(str), por_mes["dias"], marker='o', color='green')
+plt.fill_between(por_mes["mes"].astype(str), por_mes["dias"], color='lightgreen')
+plt.title("Dias de Dispensa Médica por Mês (01/01 a 30/05/2025)")
 plt.xlabel("Mês")
 plt.ylabel("Total de Dias")
 plt.grid(True)
