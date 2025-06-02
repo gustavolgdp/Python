@@ -4,21 +4,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# Caminho do arquivo local
-file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"
+# === CONFIGURAÇÕES INICIAIS ===
+file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"  # ajuste o caminho se necessário
 
-# Leitura do arquivo
 with open(file_path, encoding='utf-8') as f:
     lines = f.readlines()
 
-# Regex para data, nome Solange e dias
+# === REGEX ATUALIZADAS ===
 data_regex = re.compile(r'^(\d{2}/\d{2}/\d{4}) \d{2}:\d{2} -')
-linha_solange_regex = re.compile(r'\b(1S|2S|3S)\s+Solange\b', re.IGNORECASE)
 dias_regex = re.compile(r'(\d+)\s+dia[s]?\b', re.IGNORECASE)
+grad_nome_regex = re.compile(r'\b(1S|2S|3S|SO|CV)\s+[A-ZÁ-ÚÂ-ÛÃ-ÕÊ-ẼÉÍÓÚÇ][^\d\n-]{2,}', re.IGNORECASE)
 
+# === EXTRAÇÃO ===
 registros = []
+registros_detalhados = []
 
-print("🔍 Processando dispensas entre 01/01 e 30/05/2025 (ignorando Solange)...")
+print("🔍 Processando dispensas entre 01/01 e 30/05/2025 (com nome limpo)...")
 for line in tqdm(lines, desc="Analisando linhas"):
     data_match = data_regex.search(line)
     if data_match:
@@ -29,28 +30,31 @@ for line in tqdm(lines, desc="Analisando linhas"):
         except ValueError:
             continue
 
-        if linha_solange_regex.search(line):
-            continue
-
         dias_match = dias_regex.search(line)
-        if dias_match:
+        nome_match = grad_nome_regex.search(line)
+
+        if dias_match and nome_match:
             try:
                 dias = int(dias_match.group(1))
+                nome = nome_match.group(0).strip()
+                nome = re.sub(r'[\-\–\:]', '', nome)         # remove traços e dois-pontos
+                nome = re.sub(r'\s+', ' ', nome)             # normaliza espaços
+                nome = nome.upper()[:2] + nome[2:].title()   # graduação em maiúsculas, nome formatado
                 registros.append((data, dias))
+                registros_detalhados.append((data, nome, dias))
             except ValueError:
                 continue
 
-# Criar DataFrame
+# === GRÁFICOS ===
 df = pd.DataFrame(registros, columns=["data", "dias"])
 df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
 df["mes"] = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
 
-# Agrupamentos
 por_dia = df.groupby("data")["dias"].sum().reset_index()
 por_semana = df.groupby("semana")["dias"].sum().reset_index()
 por_mes = df.groupby("mes")["dias"].sum().reset_index()
 
-# === Gráfico por dia ===
+# === GRÁFICO POR DIA ===
 plt.figure(figsize=(14, 5))
 plt.plot(por_dia["data"], por_dia["dias"], marker='o', color='purple')
 plt.fill_between(por_dia["data"], por_dia["dias"], color='violet', alpha=0.3)
@@ -62,7 +66,7 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# === Gráfico por semana ===
+# === GRÁFICO POR SEMANA ===
 plt.figure(figsize=(12, 5))
 plt.plot(por_semana["semana"].astype(str), por_semana["dias"], marker='o', color='blue')
 plt.fill_between(por_semana["semana"].astype(str), por_semana["dias"], color='lightblue')
@@ -74,7 +78,7 @@ plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
 
-# === Gráfico por mês ===
+# === GRÁFICO POR MÊS ===
 plt.figure(figsize=(10, 5))
 plt.plot(por_mes["mes"].astype(str), por_mes["dias"], marker='o', color='green')
 plt.fill_between(por_mes["mes"].astype(str), por_mes["dias"], color='lightgreen')
@@ -85,3 +89,18 @@ plt.grid(True)
 plt.xticks(rotation=45)
 plt.tight_layout()
 plt.show()
+
+# === TABELA DETALHADA POR PESSOA ===
+df_detalhado = pd.DataFrame(registros_detalhados, columns=["data", "nome", "dias"])
+df_detalhado["mes"] = df_detalhado["data"].dt.to_period("M").astype(str)
+
+# Pivotar: pessoa x mês
+tabela_final = df_detalhado.pivot_table(index="nome", columns="mes", values="dias", aggfunc="sum", fill_value=0)
+tabela_final["Total"] = tabela_final.sum(axis=1)
+tabela_final.reset_index(inplace=True)
+
+# Exportar
+output_path = file_path.rsplit("\\", 1)[0] + "\\resumo_dispensas_por_pessoa.xlsx"
+tabela_final.to_excel(output_path, index=False)
+
+print(f"\n📁 Arquivo Excel exportado para: {output_path}")
