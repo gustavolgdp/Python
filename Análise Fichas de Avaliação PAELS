@@ -1,0 +1,88 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from wordcloud import WordCloud
+from tqdm import tqdm
+import string
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from collections import Counter
+
+# === CONFIGURAÇÕES ===
+plt.rcParams['axes.titlesize'] = 14
+sns.set(style="whitegrid")
+tqdm.pandas()
+
+# === CAMINHO DO ARQUIVO ===
+arquivo = r"C:\Python\Avaliação Prática - PAELS APP-SP 2025 (respostas).xlsx"
+df = pd.read_excel(arquivo)
+df.columns = [col.strip() for col in df.columns]  # Remover espaços nos nomes das colunas
+
+# === COLUNAS IMPORTANTES ===
+col_pessoa = "INSTRUENDO Graduação e Nome-de-Guerra"
+col_intervencao = "Quantidade de intervenções"
+col_observacoes = "Observações"
+
+# === COLUNAS AVALIATIVAS ===
+avaliacao_cols = [col for col in df.columns if col.startswith("O Instruendo aplicou")]
+if col_intervencao in df.columns:
+    avaliacao_cols.append(col_intervencao)  # incluir no loop
+
+# === GRÁFICOS DE CADA CRITÉRIO (inclui intervenções) ===
+print("📊 Gerando gráficos de critérios e intervenções...")
+for coluna in tqdm(avaliacao_cols, desc="Colunas"):
+    plt.figure(figsize=(6, 4))
+    if pd.api.types.is_numeric_dtype(df[coluna]):
+        sns.countplot(x=coluna, data=df, palette="pastel")
+        plt.xlabel(coluna)
+        plt.ylabel("Contagem")
+    else:
+        sns.countplot(y=coluna, data=df, order=df[coluna].value_counts().index, palette="pastel")
+        plt.ylabel(coluna)
+        plt.xlabel("Contagem")
+    plt.title(coluna if len(coluna) < 80 else coluna[:77] + "...")
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+# === GRÁFICO POR PESSOA ===
+print("👤 Gráfico por instruendo (Top 10)...")
+df_pessoa = df[[col_pessoa] + [col for col in avaliacao_cols if col != col_intervencao]].copy()
+top_nomes = df_pessoa[col_pessoa].value_counts().index[:10]
+df_top = df_pessoa[df_pessoa[col_pessoa].isin(top_nomes)]
+
+df_long = df_top.melt(id_vars=col_pessoa, var_name="Critério", value_name="Resposta")
+df_contagem = df_long.groupby([col_pessoa, "Resposta"]).size().reset_index(name="Total")
+
+plt.figure(figsize=(12, 6))
+sns.barplot(data=df_contagem, x=col_pessoa, y="Total", hue="Resposta", palette="pastel")
+plt.title("Distribuição de Respostas por Instruendo (Top 10)")
+plt.ylabel("Total de Respostas")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+plt.close()
+
+# === NUVEM DE PALAVRAS DAS OBSERVAÇÕES ===
+print("☁️ Gerando nuvem de palavras das observações...")
+texto = " ".join(df[col_observacoes].dropna().astype(str))
+
+stopwords_personalizadas = set(ENGLISH_STOP_WORDS).union({
+    "foi", "com", "em", "uma", "houve", "de", "do", "das", "dos", "ao", "aos",
+    "na", "no", "nas", "nos", "para", "sobre", "por", "que", "se", "o", "a", "e",
+    "entre", "sem", "após", "antes", "mas", "mesmo", "também", "como", "sendo",
+    "não", "as", "os", "isso", "essa", "esse"
+})
+
+texto_limpo = texto.translate(str.maketrans("", "", string.punctuation)).lower()
+palavras = [p for p in texto_limpo.split() if p not in stopwords_personalizadas and len(p) > 2]
+frequencia = Counter(palavras)
+
+wordcloud = WordCloud(width=1000, height=500, background_color='white').generate_from_frequencies(frequencia)
+
+plt.figure(figsize=(14, 6))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis("off")
+plt.title("Nuvem de Palavras - Observações", fontsize=16)
+plt.tight_layout()
+plt.show()
+plt.close()
