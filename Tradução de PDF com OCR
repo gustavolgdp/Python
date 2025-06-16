@@ -1,0 +1,51 @@
+import os
+from pdf2image import convert_from_path
+import pytesseract
+from googletrans import Translator
+from tqdm import tqdm
+
+# === CONFIGURAÇÕES ===
+caminho_pdf = r'C:\Python\Ragon J M - Orthodoxie Maconnique 1853.pdf'
+caminho_saida_txt = r'C:\Python\Ragon_Orthodoxie_Traduzido.txt'
+caminho_tesseract = r'C:\Program Files\Tesseract-OCR\tesseract.exe'  # AJUSTE AQUI
+
+# === CONFIGURAÇÃO DO TESSERACT ===
+pytesseract.pytesseract.tesseract_cmd = caminho_tesseract
+
+# === ETAPA 1: Converter PDF para imagens ===
+print("Convertendo páginas do PDF para imagens...")
+paginas = convert_from_path(caminho_pdf, dpi=300)
+
+# === ETAPA 2: OCR com barra de progresso ===
+print("Extraindo texto com OCR (idioma: francês)...")
+textos_extraidos = []
+for pagina in tqdm(paginas, desc="OCR", unit="página"):
+    texto = pytesseract.image_to_string(pagina, lang='fra')
+    textos_extraidos.append(texto)
+
+# === ETAPA 3: Tradução em blocos curtos ===
+print("Traduzindo para português...")
+tradutor = Translator()
+textos_traduzidos = []
+
+for texto in tqdm(textos_extraidos, desc="Tradução", unit="página"):
+    blocos = texto.split('\n')  # divide por linhas
+    traducao_final = ""
+    for bloco in blocos:
+        bloco_limpo = bloco.strip()
+        if bloco_limpo:
+            try:
+                traducao = tradutor.translate(bloco_limpo, src='fr', dest='pt')
+                traducao_final += traducao.text + '\n'
+            except Exception as e:
+                print(f"Erro ao traduzir trecho: {bloco_limpo[:40]}... => {e}")
+                traducao_final += "[Erro na tradução]\n"
+    textos_traduzidos.append(traducao_final + '\n')
+
+# === ETAPA 4: Salvar resultado em TXT ===
+print("Salvando arquivo traduzido...")
+with open(caminho_saida_txt, 'w', encoding='utf-8') as f:
+    for texto in textos_traduzidos:
+        f.write(texto + '\n')
+
+print(f"\n✅ Tradução concluída com sucesso. Arquivo salvo em:\n{caminho_saida_txt}")
