@@ -1,0 +1,54 @@
+import pandas as pd
+from PyPDF2 import PdfReader
+from tqdm import tqdm
+
+# Caminhos dos arquivos
+caminho_excel = r"C:\Python\Playbook de Rotas atualizado - Atualizado 1S Gustavo 28_07_2025.xlsx"
+caminho_pdf = r"C:\Python\AMDT.pdf"
+caminho_saida_txt = r"C:\Python\palavras_nao_encontradas.txt"
+caminho_saida_excel = r"C:\Python\palavras_nao_encontradas.xlsx"
+
+# 1. Ler a coluna "ROTA" do Excel
+df_excel = pd.read_excel(caminho_excel, usecols=["ROTA"])
+palavras = (
+    df_excel["ROTA"]
+    .dropna()
+    .astype(str)
+    .str.upper()
+    .str.split()
+    .explode()
+    .str.strip()
+    .unique()
+    .tolist()
+)
+
+# 2. Remover a palavra "DCT"
+palavras_filtradas = [p for p in palavras if p != "DCT"]
+
+# 3. Ler o texto completo do PDF com barra de progresso
+reader = PdfReader(caminho_pdf)
+texto_pdf = ""
+print("Lendo o conteúdo do PDF...")
+for page in tqdm(reader.pages, desc="Extraindo texto das páginas"):
+    texto_pdf += page.extract_text() + "\n"
+
+texto_pdf_upper = texto_pdf.upper()
+
+# 4. Verificar palavras não encontradas no PDF
+print("Verificando palavras não encontradas...")
+palavras_nao_encontradas = []
+for palavra in tqdm(palavras_filtradas, desc="Comparando palavras"):
+    if palavra not in texto_pdf_upper:
+        palavras_nao_encontradas.append(palavra)
+
+# 5. Exportar para TXT
+with open(caminho_saida_txt, "w", encoding="utf-8") as f:
+    f.write("PALAVRAS NÃO ENCONTRADAS NO PDF\n\n")
+    for palavra in palavras_nao_encontradas:
+        f.write(palavra + "\n")
+
+# 6. (Opcional) Exportar também para Excel
+df_resultado = pd.DataFrame(palavras_nao_encontradas, columns=["Palavra não encontrada no PDF"])
+df_resultado.to_excel(caminho_saida_excel, index=False)
+
+print(f"\nExportação concluída!\nTXT: {caminho_saida_txt}\nExcel: {caminho_saida_excel}")
