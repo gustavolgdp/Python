@@ -1,0 +1,220 @@
+# -*- coding: utf-8 -*-
+"""
+Streaming: conta pousos (ARR) no intervalo 20/05/2021 00:00:00 a 12/08/2025 23:59:59
+- Mostra e/ou salva gráficos (configurável)
+- Rótulos nos topos das colunas
+- Mostra tabelas-resumo por ano e por ano/mês no console
+
+Requisitos: openpyxl, python-dateutil, pandas, matplotlib
+"""
+
+import sys
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from openpyxl import load_workbook
+from dateutil import parser as dtparser
+
+# ==============================
+# CONFIGURAÇÕES
+# ==============================
+DATA_DIR = Path(r"C:\Python")                # pasta dos SBMT_*.xlsx
+FILES = sorted(DATA_DIR.glob("SBMT_*.xlsx")) # busca automática
+
+DT_INICIO = datetime(2021, 5, 20, 0, 0, 0)
+DT_FIM    = datetime(2025, 8, 12, 23, 59, 59)
+
+PROGRESS_EVERY = 50_000        # imprime progresso a cada N linhas
+OUT_DIR = Path.cwd() / "saidas_pousos"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Saídas (ajuste conforme desejar)
+SHOW_PLOTS = True              # mostrar gráficos no console/Plots do Spyder
+SAVE_PNG   = False             # salvar PNGs em OUT_DIR
+SAVE_CSV   = True              # salvar CSVs dos agregados em OUT_DIR
+
+# ==============================
+# FUNÇÕES
+# ==============================
+def _norm(s: str) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.strip().lower()
+
+def find_header_indices(header_row):
+    """Retorna índices (0-based) de 'Tipo de Operação' e 'Pouso Real'."""
+    tipo_idx = pouso_idx = None
+    for j, val in enumerate(header_row):
+        name = _norm(val)
+        if ("tipo" in name) and ("opera" in name):
+            tipo_idx = j
+        if ("pouso" in name) and ("real" in name):
+            pouso_idx = j
+    if tipo_idx is None or pouso_idx is None:
+        raise ValueError(
+            f"Não encontrei cabeçalhos. Tipo={tipo_idx}, Pouso={pouso_idx}\n"
+            f"Headers vistos: {header_row}"
+        )
+    return tipo_idx, pouso_idx
+
+def parse_datetime_maybe(x):
+    """Converte célula para datetime (aceita datetime nativo ou string)."""
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        return x
+    try:
+        return dtparser.parse(str(x), dayfirst=True, fuzzy=True)
+    except Exception:
+        return None
+
+def add_bar_labels(ax):
+    """Escreve o valor em cima de cada coluna."""
+    for p in ax.patches:
+        h = p.get_height()
+        if h is None:
+            continue
+        ax.annotate(f'{int(h):,}'.replace(',', '.'),
+                    (p.get_x() + p.get_width()/2, h),
+                    ha='center', va='bottom', fontsize=9)
+
+def show_or_save(fig, outpath=None):
+    """Mostra e/ou salva a figura conforme flags globais."""
+    if SAVE_PNG and outpath is not None:
+        fig.savefig(outpath, dpi=150, bbox_inches="tight")
+        print(f"PNG salvo: {outpath}", flush=True)
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close(fig)
+
+# ==============================
+# PROCESSAMENTO STREAMING
+# ==============================
+if not FILES:
+    print(f"Nenhum arquivo encontrado em: {DATA_DIR}\\SBMT_*.xlsx", flush=True)
+    sys.exit(1)
+
+total_pousos = 0
+por_ano = defaultdict(int)     # {ano: qtd}
+por_ano_mes = defaultdict(int) # {(ano, mes): qtd}
+
+for fpath in FILES:
+    print(f"\n>>> Abrindo: {fpath.name}", flush=True)
+    try:
+        wb = load_workbook(filename=str(fpath), read_only=True, data_only=True)
+    except Exception as e:
+        print(f"[ERRO] Falha ao abrir {fpath.name}: {e}", flush=True)
+        continue
+
+    wsname = wb.sheetnames[0]
+    ws = wb[wsname]
+    print(f"Planilha: {wsname} | Linhas estimadas: {ws.max_row}", flush=True)
+
+    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
+    try:
+        tipo_idx, pouso_idx = find_header_indices(header)
+    except Exception as e:
+        print(f"[ERRO] {e}", flush=True)
+        wb.close()
+        continue
+
+    read_rows = 0
+    file_pousos = 0
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        read_rows += 1
+        if read_rows % PROGRESS_EVERY == 0:
+            print(f"[{fpath.name}] Linhas lidas: {read_rows:,} | Pousos (acum.): {total_pousos:,}", flush=True)
+
+        try:
+            tipo = (row[tipo_idx] if tipo_idx < len(row) else None)
+            if str(tipo).strip().upper() != "ARR":
+                continue
+            dtp = parse_datetime_maybe(row[pouso_idx] if pouso_idx < len(row) else None)
+            if (dtp is None) or not (DT_INICIO <= dtp <= DT_FIM):
+                continue
+
+            total_pousos += 1
+            file_pousos += 1
+            por_ano[dtp.year] += 1
+            por_ano_mes[(dtp.year, dtp.month)] += 1
+        except Exception:
+            # Ignora linhas problemáticas
+            continue
+
+    print(f"[{fpath.name}] Processadas {read_rows:,} linhas | Pousos no intervalo neste arquivo: {file_pousos:,}", flush=True)
+    wb.close()
+
+# ==============================
+# RESULTADOS E TABELAS
+# ==============================
+print("\n====================================", flush=True)
+print("RESULTADOS – INTERVALO ALVO", flush=True)
+print(f"Início: {DT_INICIO} | Fim: {DT_FIM}", flush=True)
+print(f"Total de pousos (ARR) no intervalo: {total_pousos:,}", flush=True)
+print("====================================\n", flush=True)
+
+# DataFrames agregados
+df_ano = pd.DataFrame(sorted(por_ano.items()), columns=["ano", "pousos"])
+
+rows_mes = [{"ano": a, "mes": m, "pousos": q} for (a, m), q in sorted(por_ano_mes.items())]
+df_mes = pd.DataFrame(rows_mes)
+
+# --- Tabelas no console
+if not df_ano.empty:
+    print("Pousos por ano:", flush=True)
+    print(df_ano.to_string(index=False), flush=True)
+    print()
+
+if not df_mes.empty:
+    # Tabela 'wide' ano x mês (1..12)
+    pivot = df_mes.pivot_table(index="ano", columns="mes", values="pousos", aggfunc="sum").reindex(columns=range(1, 13)).fillna(0).astype(int)
+    pivot.columns = [f"M{m:02d}" for m in pivot.columns]
+    pivot["TOTAL_ANO"] = pivot.sum(axis=1)
+    print("Pousos por ano/mês:", flush=True)
+    print(pivot.to_string(), flush=True)
+    print()
+
+# CSVs opcionais
+if SAVE_CSV:
+    if not df_ano.empty:
+        df_ano.to_csv(OUT_DIR / "pousos_por_ano.csv", index=False, encoding="utf-8")
+    if not df_mes.empty:
+        df_mes.to_csv(OUT_DIR / "pousos_por_mes.csv", index=False, encoding="utf-8")
+        pivot.to_csv(OUT_DIR / "pousos_por_ano_mes_wide.csv", encoding="utf-8")
+    print(f"CSVs salvos em: {OUT_DIR}", flush=True)
+
+# ==============================
+# GRÁFICOS
+# ==============================
+# --- Pousos por ano
+if not df_ano.empty:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(df_ano["ano"].astype(str), df_ano["pousos"])
+    ax.set_title("Pousos por ano (ARR)")
+    ax.set_xlabel("Ano")
+    ax.set_ylabel("Quantidade de pousos")
+    add_bar_labels(ax)
+    plt.tight_layout()
+    outp = OUT_DIR / "pousos_por_ano.png" if SAVE_PNG else None
+    show_or_save(fig, outp)
+
+# --- Pousos por mês (um gráfico por ano)
+if not df_mes.empty:
+    for ano in sorted(df_mes["ano"].unique()):
+        am = df_mes[df_mes["ano"] == ano].set_index("mes")["pousos"].reindex(range(1, 13), fill_value=0)
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.bar(am.index.astype(str), am.values)
+        ax.set_title(f"Pousos por mês (ARR) — {ano}")
+        ax.set_xlabel("Mês (1–12)")
+        ax.set_ylabel("Quantidade de pousos")
+        add_bar_labels(ax)
+        plt.tight_layout()
+        outp = OUT_DIR / f"pousos_por_mes_{ano}.png" if SAVE_PNG else None
+        show_or_save(fig, outp)
+
+print("\nConcluído.", flush=True)
