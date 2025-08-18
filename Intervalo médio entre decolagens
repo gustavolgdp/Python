@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Intervalo médio entre decolagens (coluna 'Decolagem')
-Arquivo único: C:\Python\SBGR_2025_01_01_2025_05_11.xlsx
+Arquivo único: C:\Python\SBSP_2025_01_01_A_2025_08_12.xlsx
 
 - Considera apenas dias úteis (seg–sex)
-- Gera um gráfico por mês: intervalo médio por hora (0–23)
-- Mostra tabela de média por hora (dias úteis)
+- Um gráfico por mês: intervalo médio por hora (0–23)
+- Topo do gráfico com folga automática para não cortar rótulos
 """
 
 from pathlib import Path
@@ -15,30 +15,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # ===================== CONFIG =====================
-ARQUIVO = Path(r"C:\Python\SBGR_2025_01_01_2025_05_11.xlsx")  # raw string evita \P warning
-COL_DECOLAGEM_ALVO = "Decolagem"   # alvo lógico (case/acentos-insensível)
-MOSTRAR_GRAFICOS = True            # coloque False se quiser só as tabelas no console
+ARQUIVO = Path(r"C:\Python\SBSP_2025_01_01_A_2025_08_12.xlsx")
+COL_DECOLAGEM_ALVO = "Decolagem"
+MOSTRAR_GRAFICOS = True
 DESCARTAR_INTERVALOS_NEGATIVOS = True
 DESCARTAR_INTERVALOS_MUITO_GRANDES = True
-LIMITE_MINUTOS_MAX = 360           # descarta diffs > 6h (opcional)
+LIMITE_MINUTOS_MAX = 360
+HEADROOM_PERC = 0.15     # folga no topo do eixo Y (15%)
 # ===================================================
 
 plt.ion()  # gráficos não bloqueantes
 
 def _norm(s: str) -> str:
-    """Normaliza nome de coluna: minúscula, sem acentos e espaços extras."""
     s = unicodedata.normalize("NFKD", str(s))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s.strip().lower()
 
 def localizar_coluna_decolagem(cols) -> str | None:
-    """Localiza 'Decolagem' de forma robusta (case/acentos)."""
     alvo = _norm(COL_DECOLAGEM_ALVO)
     mapa = {c: _norm(c) for c in cols}
     for original, norm in mapa.items():
         if norm == alvo:
             return original
-    # alternativas usuais
     candidatos = {"decolagem", "offblock", "off-block", "off_block", "saida"}
     for original, norm in mapa.items():
         if norm in candidatos:
@@ -57,13 +55,12 @@ def ler_arquivo(p: Path) -> pd.DataFrame:
                 return pd.read_csv(p, encoding=enc)
             except Exception:
                 pass
-        raise RuntimeError(f"Falha ao ler CSV {p.name} (UTF-8/Latin-1).")
+        raise RuntimeError(f"Falha ao ler CSV {p.name}.")
     if suf == ".parquet":
         return pd.read_parquet(p)
     raise ValueError(f"Extensão não suportada: {suf}")
 
 def calcular_base(df: pd.DataFrame, col_dec: str) -> pd.DataFrame:
-    # parse e ordenação
     serie_dt = pd.to_datetime(df[col_dec], errors="coerce", dayfirst=True, infer_datetime_format=True)
     base = (
         pd.DataFrame({"decolagem": serie_dt})
@@ -71,26 +68,21 @@ def calcular_base(df: pd.DataFrame, col_dec: str) -> pd.DataFrame:
         .sort_values("decolagem")
         .reset_index(drop=True)
     )
-    # diferenças sucessivas
     base["delta_s"] = base["decolagem"].diff().dt.total_seconds()
-    # limpeza opcional
     if DESCARTAR_INTERVALOS_NEGATIVOS:
         base.loc[base["delta_s"] <= 0, "delta_s"] = np.nan
     if DESCARTAR_INTERVALOS_MUITO_GRANDES:
         base.loc[(base["delta_s"] / 60.0) > LIMITE_MINUTOS_MAX, "delta_s"] = np.nan
-    # atributos
     base["hora"] = base["decolagem"].dt.hour
-    base["weekday"] = base["decolagem"].dt.weekday          # 0=seg … 6=dom
-    base["ano_mes"] = base["decolagem"].dt.to_period("M").astype(str)  # 'YYYY-MM'
+    base["weekday"] = base["decolagem"].dt.weekday
+    base["ano_mes"] = base["decolagem"].dt.to_period("M").astype(str)
     return base
 
 def somente_dias_uteis(base: pd.DataFrame) -> pd.DataFrame:
     return base[base["weekday"] < 5].copy()
 
 def medias_por_hora_e_mes(base_uteis: pd.DataFrame):
-    # média global (dias úteis)
     media_global_min = (base_uteis["delta_s"].dropna().mean() or np.nan) / 60.0
-    # média por hora (dias úteis)
     por_hora = (
         base_uteis.dropna(subset=["delta_s"])
         .groupby("hora", as_index=False)["delta_s"]
@@ -100,7 +92,6 @@ def medias_por_hora_e_mes(base_uteis: pd.DataFrame):
         .reset_index(drop=True)
     )
     por_hora["media_min"] = por_hora["media_min"] / 60.0
-    # média por hora e por mês (dias úteis)
     por_mes_hora = (
         base_uteis.dropna(subset=["delta_s"])
         .groupby(["ano_mes", "hora"], as_index=False)["delta_s"]
@@ -115,13 +106,25 @@ def medias_por_hora_e_mes(base_uteis: pd.DataFrame):
 def plotar_um_grafico_mes(df_mes: pd.DataFrame, ano_mes: str):
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.bar(df_mes["hora"], df_mes["media_min"])
+
+    # --- folga automática no topo para não cortar rótulos ---
+    ymax = (df_mes["media_min"].max() or 0) * (1 + HEADROOM_PERC)
+    if ymax <= 0:  # evita ylim(0,0)
+        ymax = 1
+    ax.set_ylim(0, ymax)
+
     ax.set_title(f"Intervalo médio entre decolagens por hora (min) – {ano_mes} – Dias úteis")
     ax.set_xlabel("Hora do dia")
     ax.set_ylabel("Média do intervalo (min)")
     ax.set_xticks(range(0, 24))
+
+    # Rótulos com clip desligado para nunca cortar
     for x, y in zip(df_mes["hora"], df_mes["media_min"]):
         ax.annotate(f"{y:.1f}", (x, y), ha="center", va="bottom",
-                    xytext=(0, 3), textcoords="offset points", fontsize=9)
+                    xytext=(0, 3), textcoords="offset points",
+                    fontsize=9, clip_on=False)
+
+    ax.margins(x=0.02)  # um pouco de margem lateral
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     plt.tight_layout()
     plt.show(block=False); plt.pause(0.05)
@@ -135,7 +138,6 @@ def main():
     col_dec = localizar_coluna_decolagem(df.columns)
     if col_dec is None:
         raise ValueError("Coluna 'Decolagem' não encontrada no arquivo.")
-
     print(f"Usando a coluna de data-hora: '{col_dec}'", flush=True)
 
     base = calcular_base(df, col_dec)
@@ -143,7 +145,6 @@ def main():
 
     media_global_min, por_hora, por_mes_hora = medias_por_hora_e_mes(base_uteis)
 
-    # --- Tabelas no console ---
     print("\n--- Intervalo médio global (dias úteis) ---")
     if pd.isna(media_global_min):
         print("Não foi possível calcular (dados insuficientes).")
@@ -165,7 +166,6 @@ def main():
     meses = por_mes_hora["ano_mes"].unique().tolist()
     print(meses)
 
-    # --- Gráficos: um por mês (dias úteis) ---
     if MOSTRAR_GRAFICOS:
         for am in meses:
             df_mes = por_mes_hora[por_mes_hora["ano_mes"] == am]
