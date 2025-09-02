@@ -1,0 +1,103 @@
+# -*- coding: utf-8 -*-
+"""
+Estudo-padrão (sintético) – Heatmap do atraso médio (min) por ocupação × SBMT/h
+
+Ajustes pedidos:
+- Paleta selecionável entre 'viridis' e 'magma'
+- Fundo PRETO quando valor == 0.0
+- Se o fundo for amarelo/claro, texto em PRETO (senão, BRANCO)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib import cm
+
+# ===================== CONFIG =====================
+CAP_NOMINAL = 24
+HORAS_DIA   = list(range(6, 24))          # 06..23
+OCUPACOES   = [0.70, 0.85, 0.95, 1.00]
+SBMT_LIST   = [0, 1, 2, 4]
+
+# Escolha da paleta: 'viridis' ou 'magma'
+CMAP_NAME = "viridis"   # altere para "magma" se preferir
+
+# ===================== MODELO =====================
+def simula_dia_atraso_medio(ocupacao: float, sbmt_por_hora: int,
+                            cap_nominal: int = CAP_NOMINAL,
+                            horas=HORAS_DIA) -> float:
+    cap_eff = max(0.0, cap_nominal - sbmt_por_hora)
+    demand = ocupacao * cap_nominal
+    backlog = 0.0
+    atrasos_min = []
+    for _ in horas:
+        served = min(demand + backlog, cap_eff)
+        backlog_next = max(0.0, backlog + demand - cap_eff)
+        L_avg = (backlog + backlog_next) / 2.0
+        lam   = max(served, 1e-9)
+        W_min = (L_avg / lam) * 60.0
+        atrasos_min.append(W_min)
+        backlog = backlog_next
+    return float(np.mean(atrasos_min)) if atrasos_min else 0.0
+
+# ===================== EXECUÇÃO =====================
+heat = np.zeros((len(OCUPACOES), len(SBMT_LIST)), dtype=float)
+for i, occ in enumerate(OCUPACOES):
+    for j, s in enumerate(SBMT_LIST):
+        heat[i, j] = simula_dia_atraso_medio(occ, s)
+
+df_tab = pd.DataFrame(heat, index=[f"{int(100*o)}%" for o in OCUPACOES],
+                      columns=[f"{s} SBMT/h" for s in SBMT_LIST])
+print("\nAtraso médio (min) – estudo-padrão sintético")
+print(df_tab.round(2))
+
+# ===================== GRÁFICO (heatmap) =====================
+fig, ax = plt.subplots(figsize=(8.4, 5.6))
+
+# Paleta escolhida + fundo preto para valores "under"
+cmap = cm.get_cmap(CMAP_NAME).copy()
+cmap.set_under("black")           # tudo abaixo de vmin fica preto
+
+# Para tornar 0.0 "under": use vmin > 0
+eps = 1e-9
+vmin = eps
+vmax = heat.max() if heat.max() > 0 else 1.0
+
+im = ax.imshow(heat, aspect="auto", origin="upper",
+               cmap=cmap, vmin=vmin, vmax=vmax)
+
+# Eixos/ticks
+ax.set_xticks(range(len(SBMT_LIST)))
+ax.set_yticks(range(len(OCUPACOES)))
+ax.set_xticklabels([str(s) for s in SBMT_LIST])
+ax.set_yticklabels([f"{int(100*o)}%" for o in OCUPACOES])
+ax.set_xlabel("Inserções SBMT por hora")
+ax.set_ylabel("Ocupação da capacidade nominal de SBSP")
+ax.set_title("Estudo sintético – Atraso médio (min) por ocupação × SBMT/h")
+
+# Função para escolher cor do texto por contraste (preto para fundo claro/amarelo)
+def text_color_for_background(val):
+    if val <= 0:           # 0.0 -> fundo preto
+        return "white"
+    # normaliza e obtém a cor de fundo
+    norm = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.0
+    r, g, b, _ = cmap(norm)
+    # luminância perceptual
+    lumin = 0.299*r + 0.587*g + 0.114*b
+    return "black" if lumin >= 0.7 else "white"
+
+# Anotações nos quadrantes
+for i in range(len(OCUPACOES)):
+    for j in range(len(SBMT_LIST)):
+        val = heat[i, j]
+        ax.text(j, i, f"{val:.1f}",
+                ha="center", va="center",
+                color=text_color_for_background(val),
+                fontsize=9)
+
+# Barra de cores
+cbar = fig.colorbar(im, ax=ax)
+cbar.set_label("Atraso médio (min)")
+
+plt.tight_layout()
+plt.show()
