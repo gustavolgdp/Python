@@ -1,0 +1,153 @@
+# -*- coding: utf-8 -*-
+"""
+Série temporal de pousos (ARR) em SBSP em 2024
+- Agregação em janelas de 15 minutos
+- Reagregação por hora
+- Gráficos para as duas séries, com média móvel (7 dias)
+
+Entrada: C:\Python\SBSP_2024_01_01_2024_12_31.csv
+Requisitos no CSV: colunas Pista, Tipo de Operação, Pouso Real
+"""
+
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import csv, re, unicodedata
+
+# ===================== CONFIG =====================
+ARQ = Path(r"C:\Python\SBSP_2024_01_01_2024_12_31.csv")
+
+# Filtrar apenas RWY 17 (17L/17R/17P)? Se False, considera todas as pistas.
+ONLY_RWY17 = True
+
+# Se quiser sombrear as horas operacionais típicas (06–23) nos gráficos diários,
+# deixe True (apenas efeito visual em eixos de data contínua).
+SOMBRA_HORAS_OP = False  # pode deixar False; útil quando se analisa poucos dias
+
+# ===================== HELPERS =====================
+def sniff_delimiter_and_encoding(path, sample_bytes=1024*64):
+    raw = path.open("rb").read(sample_bytes)
+    try:
+        text = raw.decode("utf-8-sig"); enc = "utf-8-sig"
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1");    enc = "latin-1"
+    try:
+        dialect = csv.Sniffer().sniff(text, delimiters=";,")
+        sep = dialect.delimiter
+    except Exception:
+        first = text.splitlines()[0] if text else ""
+        sep = ";" if first.count(";") >= first.count(",") else ","
+    return sep, enc
+
+def strip_accents(s):
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if unicodedata.category(c) != "Mn")
+
+def norm_header(s):
+    s = s.strip().replace("\u00A0", " ")
+    s = strip_accents(s)
+    s = re.sub(r"\s+", "_", s)
+    return s.lower()
+
+def detectar_colunas(df):
+    C_TIPO   = ["tipo_de_operacao","tipo_operacao","tipo"]
+    C_POUSO  = ["pouso_real","hora_pouso_real","data_hora_pouso","datahora_pouso","pouso"]
+    C_PISTA  = ["pista","rwy","runway"]
+    cols = list(df.columns)
+    col_tipo  = next((c for c in C_TIPO  if c in cols), None)
+    col_pouso = next((c for c in C_POUSO if c in cols), None)
+    col_pista = next((c for c in C_PISTA if c in cols), None)
+    if not (col_tipo and col_pouso and col_pista):
+        raise ValueError(f"Colunas essenciais não encontradas. Disponíveis: {cols[:12]} ...")
+    return col_tipo, col_pouso, col_pista
+
+def carregar_series_15m_e_hora(ARQ: Path, only_rwy17=True):
+    """Retorna duas séries (DataFrame):
+       - s15: contagem por timestamp de 15 min (col 'arr_15min')
+       - sh:  contagem por hora (col 'arr_hour')
+    """
+    sep, enc = sniff_delimiter_and_encoding(ARQ)
+    df = pd.read_csv(ARQ, sep=sep, encoding=enc, dtype=str, engine="python", on_bad_lines="skip")
+    df.columns = [norm_header(c) for c in df.columns]
+    col_tipo, col_pouso, col_pista = detectar_colunas(df)
+
+    # Pousos (ARR)
+    df = df[df[col_tipo].astype(str).str.strip().str.upper().eq("ARR")].copy()
+
+    # (Opcional) RWY 17
+    if only_rwy17:
+        pista = df[col_pista].astype(str).str.upper().str.replace(" ", "")
+        df = df[pista.isin(["17L","17R","17P"])].copy()
+
+    # Parse de data-hora do pouso
+    df[col_pouso] = pd.to_datetime(df[col_pouso].astype(str).str.strip(),
+                                   dayfirst=True, errors="coerce")
+    df = df.dropna(subset=[col_pouso])
+
+    # Série de 15 minutos
+    df["ts_15"] = df[col_pouso].dt.floor("15min")
+    s15 = (df.groupby("ts_15").size()
+             .rename("arr_15min")
+             .to_frame()
+             .sort_index())
+
+    # Série horária
+    df["ts_h"] = df[col_pouso].dt.floor("H")
+    sh = (df.groupby("ts_h").size()
+            .rename("arr_hour")
+            .to_frame()
+            .sort_index())
+
+    return s15, sh
+
+def diagnostico_series(s15: pd.DataFrame, sh: pd.DataFrame):
+    print("=== Diagnóstico ===")
+    if not s15.empty:
+        print(f"15 min:  {s15.index.min()}  →  {s15.index.max()} | pontos = {len(s15)} | total ARR = {int(s15['arr_15min'].sum())}")
+    if not sh.empty:
+        print(f"Hora:    {sh.index.min()}  →  {sh.index.max()} | pontos = {len(sh)} | total ARR = {int(sh['arr_hour'].sum())}")
+
+# ===================== MAIN =====================
+if __name__ == "__main__":
+    s15, sh = carregar_series_15m_e_hora(ARQ, only_rwy17=ONLY_RWY17)
+    diagnostico_series(s15, sh)
+
+    # --------- GRÁFICO 1: Série de 15 minutos + média móvel 7 dias ---------
+    # (rolling de 7 dias sobre 15-min ⇒ janela = 7*24*4 = 672 amostras)
+    if not s15.empty:
+        s15_rolling = s15["arr_15min"].rolling(window=7*24*4, min_periods=1).mean()
+
+        fig, ax = plt.subplots(figsize=(14,5))
+        ax.plot(s15.index, s15["arr_15min"], linewidth=0.8, alpha=0.6, label="ARR (15 min)")
+        ax.plot(s15.index, s15_rolling, linewidth=2.0, label="Média móvel (7 dias)")
+        ax.set_title(f"SBSP – Série temporal de pousos (ARR) – 15 minutos"
+                     + (" – RWY 17" if ONLY_RWY17 else " – Todas as pistas"))
+        ax.set_xlabel("Data"); ax.set_ylabel("Chegadas por 15 min")
+        ax.legend(loc="upper left")
+
+        # eixo de data: marca mensal
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b/%Y"))
+        ax.xaxis.set_minor_locator(mdates.WeekLocator(byweekday=0))  # segundas (opcional)
+        plt.tight_layout()
+        plt.show()
+
+    # --------- GRÁFICO 2: Série por hora + média móvel 7 dias ---------
+    # (7 dias sobre série horária ⇒ 7*24 = 168 amostras)
+    if not sh.empty:
+        sh_rolling = sh["arr_hour"].rolling(window=7*24, min_periods=1).mean()
+
+        fig2, ax2 = plt.subplots(figsize=(14,5))
+        ax2.plot(sh.index, sh["arr_hour"], linewidth=0.9, alpha=0.7, label="ARR (hora)")
+        ax2.plot(sh.index, sh_rolling, linewidth=2.2, label="Média móvel (7 dias)")
+        ax2.set_title(f"SBSP – Série temporal de pousos (ARR) – Horária"
+                      + (" – RWY 17" if ONLY_RWY17 else " – Todas as pistas"))
+        ax2.set_xlabel("Data"); ax2.set_ylabel("Chegadas por hora")
+        ax2.legend(loc="upper left")
+
+        ax2.xaxis.set_major_locator(mdates.MonthLocator())
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b/%Y"))
+        ax2.xaxis.set_minor_locator(mdates.WeekLocator(byweekday=0))
+        plt.tight_layout()
+        plt.show()
