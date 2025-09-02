@@ -1,0 +1,351 @@
+# -*- coding: utf-8 -*-
+"""
+SBSP – RWY 17 (17L/17R/17P) — modelo com redução de separação para pares que envolvem SBMT
+Gráficos + resumo 12–22 + colunas de médias 12–22
+
+Para cada dia em DIAS_ESPECIAIS:
+  (A) Demanda x Capacidade x Spillover (RWY 17) na janela 08→02 (ordem 08..23,00,01,02)
+      -> Linha vermelha contínua = capacidade efetiva com 3 NM nos pares SBMT
+      -> Linha vermelha tracejada = capacidade publicada (24)
+      -> Spillover em laranja
+  (B) Atraso médio por hora (0–4 SBMT/h) na janela 08→02
+  (D) Colunas: Médias 12–22 (0–4 SBMT/h) no dia selecionado
+
+Além disso:
+  (C) Média 2024: Atraso médio por hora-do-dia (0–4 SBMT/h), eixo 08..23,00,01,02 (liga 23→00)
+  (E) Atraso médio GLOBAL 2024 (RWY 17, 08..23,00..02) para 0–4 SBMT/h.
+
+Entrada: C:\Python\SBSP_2024_01_01_2024_12_31.csv
+Requisitos no CSV: colunas Pista, Tipo de Operação, Pouso Real
+"""
+
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import csv, re, unicodedata
+
+# ===================== CONFIG =====================
+MOVS_CSV = Path(r"C:\Python\SBSP_2024_01_01_2024_12_31.csv")
+
+# Dias para replicar A/B/D
+DIAS_ESPECIAIS = ["2024-03-31", "2024-04-25"]
+
+# Capacidade publicada de pousos SBSP/h (linha tracejada)
+CAP_SBSP_BASE = 24
+
+# Cenários de SBMT/h
+CENARIOS_SBMT = [0, 1, 2, 3, 4]
+
+# Cenário usado no gráfico A (Demanda × Capacidade × Spillover)
+CENARIO_SPILLOVER = 4
+
+# Separações (em milhas náuticas)
+SEPARACAO_BASE_NM  = 4.0   # S0 (padrão na final sem SBMT)
+SEPARACAO_SBMT_NM  = 3.0   # S1 (aplicada antes e depois da aeronave SBMT)
+
+# Janela para o resumo textual e barras (D)
+RESUMO_HINI, RESUMO_HFIM = 12, 22  # 12:00–22:59
+
+# Janela operacional usada no gráfico ANUAL e GLOBAL:
+ANUAL_INTERVALO = list(range(8,24)) + [0,1,2]
+
+# ===================== HELPERS =====================
+def sniff_delimiter_and_encoding(path, sample_bytes=1024*64):
+    raw = path.open("rb").read(sample_bytes)
+    try:
+        text = raw.decode("utf-8-sig"); enc = "utf-8-sig"
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1");    enc = "latin-1"
+    try:
+        dialect = csv.Sniffer().sniff(text, delimiters=";,")
+        sep = dialect.delimiter
+    except Exception:
+        first = text.splitlines()[0] if text else ""
+        sep = ";" if first.count(";") >= first.count(",") else ","
+    return sep, enc
+
+def strip_accents(s):
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if unicodedata.category(c) != "Mn")
+
+def normalize_header(s):
+    s = s.strip().replace("\u00A0", " ")
+    s = re.sub(r"\s+", "_", s)
+    s = strip_accents(s).lower()
+    return s
+
+def load_movements_only_rwy17(movs_csv: Path) -> pd.DataFrame:
+    sep, enc = sniff_delimiter_and_encoding(movs_csv)
+    df = pd.read_csv(movs_csv, sep=sep, encoding=enc, engine="python",
+                     dtype=str, on_bad_lines="skip")
+    orig_cols = df.columns.tolist()
+    df.columns = [normalize_header(c) for c in df.columns]
+
+    C_TIPO   = ["tipo_de_operacao","tipo_operacao","tipo"]
+    C_POUSO  = ["pouso_real","hora_pouso_real","data_hora_pouso","datahora_pouso","pouso"]
+    C_PISTA  = ["pista","rwy","runway"]
+
+    col_tipo  = next((c for c in C_TIPO  if c in df.columns), None)
+    col_pouso = next((c for c in C_POUSO if c in df.columns), None)
+    col_pista = next((c for c in C_PISTA if c in df.columns), None)
+    if not (col_tipo and col_pouso and col_pista):
+        raise ValueError(f"Verifique nomes de colunas. Encontrei: {orig_cols[:12]} ...")
+
+    # chegadas + RWY 17 (17L/17R/17P)
+    df = df[df[col_tipo].astype(str).str.strip().str.upper().eq("ARR")].copy()
+    pista = df[col_pista].astype(str).str.upper().str.replace(" ", "")
+    df = df[pista.isin(["17L","17R","17P"])].copy()
+
+    # horário real do pouso
+    df[col_pouso] = pd.to_datetime(df[col_pouso].astype(str).str.strip(),
+                                   dayfirst=True, errors="coerce")
+    df = df.dropna(subset=[col_pouso])
+
+    # agrega em 15 min
+    df["timestamp_15min"] = df[col_pouso].dt.floor("15min")
+    agg15 = (df.groupby("timestamp_15min").size()
+               .reset_index(name="arr_sbsp"))
+    return agg15.sort_values("timestamp_15min").reset_index(drop=True)
+
+def prepara_horario_dia(df15: pd.DataFrame, dia_str: str) -> pd.DataFrame:
+    """Demanda por HORA (dia inteiro 00–23)."""
+    d = df15.copy()
+    d["hour"] = d["timestamp_15min"].dt.floor("H")
+    d = d[d["hour"].dt.strftime("%Y-%m-%d") == dia_str]
+    if d.empty:
+        raise SystemExit(f"Não há dados para {dia_str}.")
+    return (d.groupby("hour", as_index=False)["arr_sbsp"]
+              .sum().rename(columns={"arr_sbsp":"demanda"}))
+
+def prepara_horario_janela(df15: pd.DataFrame, dia_str: str,
+                           ini_h=8, fim_h=2) -> pd.DataFrame:
+    """
+    Janela 08→02 em ordem cronológica:
+      - 08:00–23:00 do 'dia_str'
+      - 00:00–02:00 do dia seguinte
+    """
+    base_day = pd.to_datetime(dia_str)
+    next_day = base_day + pd.Timedelta(days=1)
+
+    d = df15.copy()
+    d["hour"] = d["timestamp_15min"].dt.floor("H")
+    d["hod"]  = d["hour"].dt.hour
+
+    part1 = d[(d["hour"].dt.strftime("%Y-%m-%d") == dia_str) & (d["hod"] >= ini_h)]
+    part2 = d[(d["hour"].dt.strftime("%Y-%m-%d") == next_day.strftime("%Y-%m-%d")) & (d["hod"] <= fim_h)]
+
+    dd = pd.concat([part1, part2], ignore_index=True)
+    if dd.empty:
+        raise SystemExit(f"Não há dados para {dia_str} na janela 08→02.")
+
+    dfh = (dd.groupby("hour", as_index=False)["arr_sbsp"].sum()
+             .rename(columns={"arr_sbsp":"demanda"}))
+    dfh = dfh.sort_values("hour").reset_index(drop=True)
+    return dfh
+
+# ========= NOVO: capacidade efetiva quando há k SBMT/h (3 NM nos pares SBMT) =========
+def capacidade_efetiva_com_sbmt(cap_base: float, k_sbmt: int,
+                                s_base_nm: float, s_sbmt_nm: float) -> float:
+    """
+    cap_eff = cap_base + 2 * k * (1 - s_sbmt_nm / s_base_nm)
+    (cada SBMT afeta dois 'gaps': antes e depois)
+    """
+    ganho_por_k = 2.0 * (1.0 - (s_sbmt_nm / s_base_nm))
+    return cap_base + ganho_por_k * float(k_sbmt)
+
+def simula_backlog_e_atraso(dfh: pd.DataFrame, cap_base: int, sbmt_por_hora: int,
+                            s_base_nm: float = SEPARACAO_BASE_NM,
+                            s_sbmt_nm: float = SEPARACAO_SBMT_NM) -> pd.DataFrame:
+    """Modelo backlog por hora com capacidade efetiva ajustada por 3 NM nos pares SBMT."""
+    cap_eff = capacidade_efetiva_com_sbmt(cap_base, sbmt_por_hora, s_base_nm, s_sbmt_nm)
+
+    backlog = 0.0
+    served_list, spill_list, wmean_list, cap_list = [], [], [], []
+
+    for _, row in dfh.iterrows():
+        demand = float(row["demanda"])
+        # capacidade efetiva assume k constante na hora (cenário)
+        cap = cap_eff
+        served = min(demand + backlog, cap)
+        backlog_next = max(0.0, backlog + demand - cap)
+
+        L_avg = (backlog + backlog_next) / 2.0
+        lam = max(served, 1e-6)             # h^-1
+        W_mean_min = (L_avg / lam) * 60.0   # minutos
+
+        served_list.append(served)
+        spill_list.append(backlog_next)
+        wmean_list.append(W_mean_min)
+        cap_list.append(cap)
+        backlog = backlog_next
+
+    out = dfh.copy()
+    out["capacidade"] = cap_list
+    out["served"] = served_list
+    out["spillover"] = spill_list
+    out["atraso_medio_min"] = wmean_list
+    return out
+
+def atraso_medio_anual_por_hod(df15: pd.DataFrame, cap_base: int,
+                               sbmt_por_hora: int,
+                               ordem_horas=ANUAL_INTERVALO) -> pd.DataFrame:
+    """Média 2024 por hora-do-dia; retorna já ordenado como 08..23,00,01,02."""
+    d = df15.copy()
+    d["date"] = df15["timestamp_15min"].dt.date
+    d["hour"] = df15["timestamp_15min"].dt.floor("H")
+    d["hod"]  = d["hour"].dt.hour
+    d = d[d["hod"].isin(ordem_horas)]
+
+    d_hour = (d.groupby(["date","hour"], as_index=False)["arr_sbsp"]
+                .sum().rename(columns={"arr_sbsp":"demanda"}))
+
+    results = []
+    for _, g in d_hour.groupby("date"):
+        g = g.sort_values("hour").reset_index(drop=True)
+        res = simula_backlog_e_atraso(g, cap_base, sbmt_por_hora)
+        res["hod"] = pd.to_datetime(res["hour"]).dt.hour
+        results.append(res)
+
+    if not results:
+        return pd.DataFrame(columns=["hod","atraso_medio_min"])
+
+    mean_hod = (pd.concat(results, ignore_index=True)
+                  .groupby("hod", as_index=False)["atraso_medio_min"]
+                  .mean())
+
+    pos = {h:i for i,h in enumerate(ordem_horas)}
+    mean_hod["pos"] = mean_hod["hod"].map(pos)
+    return mean_hod.sort_values("pos").drop(columns="pos").reset_index(drop=True)
+
+def atraso_medio_anual_global(df15: pd.DataFrame, cap_base: int,
+                              sbmt_por_hora: int,
+                              ordem_horas=ANUAL_INTERVALO) -> float:
+    """Atraso médio GLOBAL em 2024 (min), RWY 17, apenas horas em ordem_horas."""
+    d = df15.copy()
+    d["date"] = df15["timestamp_15min"].dt.date
+    d["hour"] = df15["timestamp_15min"].dt.floor("H")
+    d["hod"]  = d["hour"].dt.hour
+    d = d[d["hod"].isin(ordem_horas)]
+
+    d_hour = (d.groupby(["date","hour"], as_index=False)["arr_sbsp"]
+                .sum().rename(columns={"arr_sbsp":"demanda"}))
+
+    all_res = []
+    for _, g in d_hour.groupby("date"):
+        g = g.sort_values("hour").reset_index(drop=True)
+        res = simula_backlog_e_atraso(g, cap_base, sbmt_por_hora)
+        all_res.append(res[["hour","atraso_medio_min"]])
+
+    if not all_res:
+        return 0.0
+    all_res = pd.concat(all_res, ignore_index=True)
+    return float(all_res["atraso_medio_min"].mean())
+
+# ===================== MAIN =====================
+df15_rwy17 = load_movements_only_rwy17(MOVS_CSV)
+print(f"RWY 17: {len(df15_rwy17)} janelas de 15 min | total ARR = {int(df15_rwy17['arr_sbsp'].sum())}")
+
+# ----- (C) Média 2024 por hora-do-dia (08..23,00..02), ligando 23→00 -----
+plt.figure(figsize=(12,5))
+ordem_hod = ANUAL_INTERVALO
+pos_map   = {h:i for i,h in enumerate(ordem_hod)}
+
+for s in CENARIOS_SBMT:
+    mean_hod = atraso_medio_anual_por_hod(df15_rwy17, CAP_SBSP_BASE, s, ordem_horas=ordem_hod)
+    if mean_hod.empty:
+        continue
+    mean_hod = mean_hod[mean_hod["hod"].isin(ordem_hod)].copy()
+    mean_hod["pos"] = mean_hod["hod"].map(pos_map)
+    mean_hod = mean_hod.sort_values("pos")
+    plt.plot(mean_hod["pos"], mean_hod["atraso_medio_min"], marker="o", label=f"{s} SBMT/h")
+
+plt.xticks(list(range(len(ordem_hod))), [f"{h:02d}" for h in ordem_hod])
+plt.title("Média 2024 | Atraso médio por hora-do-dia – RWY 17 (08..23, 00..02) – com 3 NM nos pares SBMT")
+plt.xlabel("Hora do dia"); plt.ylabel("Atraso médio (min)")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# ----- Loop dos dias especiais: A, B e D para cada data -----
+for DIA_ESCOLHIDO in DIAS_ESPECIAIS:
+    print(f"\n=== Processando {DIA_ESCOLHIDO} ===")
+
+    # Janela 08→02 para A e B
+    dfh_0802 = prepara_horario_janela(df15_rwy17, DIA_ESCOLHIDO, ini_h=8, fim_h=2)
+
+    # Eixo horário 08..23,00,01,02 com timestamps reais
+    start_tick = pd.to_datetime(DIA_ESCOLHIDO) + pd.Timedelta(hours=8)
+    end_tick   = pd.to_datetime(DIA_ESCOLHIDO) + pd.Timedelta(days=1, hours=2)
+    ticks_0802 = pd.date_range(start_tick, end_tick, freq="H")
+
+    # (A) Demanda × Capacidade × Spillover
+    resA = simula_backlog_e_atraso(dfh_0802, CAP_SBSP_BASE, CENARIO_SPILLOVER)
+    cap_eff_value = capacidade_efetiva_com_sbmt(CAP_SBSP_BASE, CENARIO_SPILLOVER,
+                                                SEPARACAO_BASE_NM, SEPARACAO_SBMT_NM)
+
+    fig, ax = plt.subplots(figsize=(11,5))
+    ax.bar(resA["hour"], resA["demanda"], width=0.03, label="Demanda (ARR SBSP – RWY 17)")
+    # linha vermelha contínua: capacidade efetiva (pode ser > 24)
+    ax.plot(resA["hour"], [cap_eff_value]*len(resA), color="red", linewidth=2,
+            label=f"Capacidade efetiva (k={CENARIO_SPILLOVER}/h, 3NM pares SBMT)")
+    # linha vermelha tracejada: capacidade publicada (24)
+    ax.plot(resA["hour"], [CAP_SBSP_BASE]*len(resA), color="red", linestyle="--", linewidth=1.8,
+            label="Capacidade publicada (24)")
+    # spillover (laranja)
+    ax.plot(resA["hour"], resA["spillover"], linewidth=2, marker="o",
+            color="orange", label="Spillover acumulado")
+    ax.set_title(f"SBSP – {DIA_ESCOLHIDO} | Demanda × Capacidade × Spillover – RWY 17 (08→02)")
+    ax.set_xlabel("Hora do dia"); ax.set_ylabel("Movimentos / Backlog"); ax.legend()
+    ax.set_xticks(ticks_0802); ax.xaxis.set_major_formatter(mdates.DateFormatter("%H"))
+    plt.xticks(rotation=0); plt.tight_layout(); plt.show()
+
+    # (B) Atraso médio por hora – 0..4 SBMT/h (08→02)
+    plt.figure(figsize=(11,5))
+    for s in CENARIOS_SBMT:
+        res = simula_backlog_e_atraso(dfh_0802, CAP_SBSP_BASE, s)
+        plt.plot(res["hour"], res["atraso_medio_min"], marker="o", label=f"{s} SBMT/h")
+    plt.title(f"SBSP – {DIA_ESCOLHIDO} | Atraso médio por hora – RWY 17 (08→02) – 3 NM pares SBMT")
+    plt.xlabel("Hora do dia"); plt.ylabel("Atraso médio (min)"); plt.legend()
+    ax = plt.gca()
+    ax.set_xticks(ticks_0802); ax.xaxis.set_major_formatter(mdates.DateFormatter("%H"))
+    plt.xticks(rotation=0); plt.tight_layout(); plt.show()
+
+    # (D) Texto no console + gráfico de colunas: médias 12–22 (usa dia inteiro)
+    dfh_full_day = prepara_horario_dia(df15_rwy17, DIA_ESCOLHIDO)
+
+    print(f"Resumo – Atraso médio entre 12:00 e 22:59 no dia {DIA_ESCOLHIDO} (RWY 17):")
+    medias_1222 = []
+    for s in CENARIOS_SBMT:
+        res = simula_backlog_e_atraso(dfh_full_day, CAP_SBSP_BASE, s)
+        tmp = res.copy()
+        tmp["hod"] = tmp["hour"].dt.hour
+        tmp = tmp[(tmp["hod"] >= RESUMO_HINI) & (tmp["hod"] <= RESUMO_HFIM)]
+        atraso_med_1222 = tmp["atraso_medio_min"].mean() if not tmp.empty else 0.0
+        medias_1222.append((s, atraso_med_1222))
+        print(f"  • {s} SBMT/h → atraso médio 12–22 = {atraso_med_1222:.2f} min")
+
+    cenarios = [str(s) for s, _ in medias_1222]
+    valores  = [v for _, v in medias_1222]
+    plt.figure(figsize=(8,5))
+    bars = plt.bar(cenarios, valores)
+    plt.title(f"Média de atraso (12–22) no dia {DIA_ESCOLHIDO} – RWY 17 (3 NM pares SBMT)")
+    plt.xlabel("Inserções SBMT por hora"); plt.ylabel("Atraso médio (min)")
+    for b in bars:
+        h = b.get_height()
+        plt.text(b.get_x() + b.get_width()/2.0, h, f"{h:.1f}", ha="center", va="bottom")
+    plt.tight_layout(); plt.show()
+
+# ----- (E) Atraso MÉDIO GLOBAL 2024 por cenário (RWY 17, 08..23, 00..02) -----
+glob_vals = []
+for s in CENARIOS_SBMT:
+    v = atraso_medio_anual_global(df15_rwy17, CAP_SBSP_BASE, s, ordem_horas=ANUAL_INTERVALO)
+    glob_vals.append((s, v))
+    print(f"Global 2024 | {s} SBMT/h → atraso médio = {v:.2f} min")
+
+plt.figure(figsize=(8,5))
+bars = plt.bar([str(s) for s,_ in glob_vals], [v for _,v in glob_vals])
+plt.title("Atraso médio GLOBAL 2024 – RWY 17 (08..23, 00..02) – 3 NM pares SBMT")
+plt.xlabel("Inserções SBMT por hora"); plt.ylabel("Atraso médio (min)")
+for b in bars:
+    h = b.get_height()
+    plt.text(b.get_x() + b.get_width()/2, h, f"{h:.1f}", ha="center", va="bottom")
+plt.tight_layout(); plt.show()
