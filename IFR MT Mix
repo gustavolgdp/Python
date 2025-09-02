@@ -1,0 +1,160 @@
+# -*- coding: utf-8 -*-
+"""
+Mix de aeronaves por 'Esteira de Turbulência' (J/H/M/L/Outros)
+- Lê C:\Python\SBSP_2024_01_01_2024_12_31.csv
+- Detecta separador e encoding automaticamente
+- Encontra as colunas de "Esteira de Turbulência" e "Pista"
+- Remove do mix registros com Pista 17P ou 35P
+- Normaliza valores de esteira (J/H/M/L + aliases); outros ficam 'OUTROS:<valor>'
+- Imprime tabela com contagem/percentual; salva CSV; plota gráfico de barras
+"""
+
+from pathlib import Path
+import pandas as pd
+import csv, re, unicodedata
+import matplotlib.pyplot as plt
+
+# ============ CONFIG ============
+ARQ = Path(r"C:\Python\SBSP_2024_01_01_2024_12_31.csv")
+SAIDA_CSV = Path(r"C:\Python\mix_esteira_turbulencia.csv")
+
+# ============ FUNÇÕES AUX ============
+def sniff_delimiter_and_encoding(path, sample_bytes=1024*64):
+    raw = path.open("rb").read(sample_bytes)
+    try:
+        text = raw.decode("utf-8-sig"); enc = "utf-8-sig"
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1");    enc = "latin-1"
+    try:
+        dialect = csv.Sniffer().sniff(text, delimiters=";,")
+        sep = dialect.delimiter
+    except Exception:
+        first = text.splitlines()[0] if text else ""
+        sep = ";" if first.count(";") >= first.count(",") else ","
+    return sep, enc
+
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if unicodedata.category(c) != "Mn")
+
+def norm_header(s: str) -> str:
+    s = s.strip().replace("\u00A0", " ")
+    s = strip_accents(s)
+    s = re.sub(r"\s+", "_", s)
+    return s.lower()
+
+def encontrar_coluna_esteira(cols_norm):
+    candidatos = [
+        "esteira_de_turbulencia", "esteira_turbulencia", "esteira",
+        "wake_turbulence", "wake_turbulence_category", "wake",
+        "wtc", "categoria_esteira", "cat_esteira"
+    ]
+    for c in candidatos:
+        if c in cols_norm:
+            return c
+    for c in cols_norm:
+        if ("esteira" in c) or ("wake" in c and ("turb" in c or c == "wake")):
+            return c
+    return None
+
+def encontrar_coluna_pista(cols_norm):
+    candidatos = ["pista", "rwy", "runway"]
+    for c in candidatos:
+        if c in cols_norm:
+            return c
+    for c in cols_norm:
+        if "pista" in c or "runway" in c or c == "rwy":
+            return c
+    return None
+
+def normalizar_valor_esteira(v: str) -> str:
+    if pd.isna(v):
+        return "N/A"
+    s = str(v).strip().upper()
+    s = s.replace("SUPER", "J").replace("HEAVY", "H").replace("HVY", "H")
+    s = s.replace("MEDIUM", "M").replace("MEDIO", "M").replace("MED", "M")
+    s = s.replace("LIGHT", "L").replace("LEVE", "L").replace("LGT", "L").replace("LIG", "L")
+    s = s.replace("J ", "J").replace("H ", "H").replace("M ", "M").replace("L ", "L")
+    if s in {"J", "H", "M", "L"}:
+        return s
+    if s in {"", "-", "NA", "N/A", "NULL", "NONE"}:
+        return "N/A"
+    return f"OUTROS:{s}"
+
+# ============ MAIN ============
+if __name__ == "__main__":
+    # 1) leitura + normalização de cabeçalhos
+    sep, enc = sniff_delimiter_and_encoding(ARQ)
+    df = pd.read_csv(ARQ, sep=sep, encoding=enc, dtype=str,
+                     engine="python", on_bad_lines="skip")
+    orig_cols = list(df.columns)
+    df.columns = [norm_header(c) for c in orig_cols]
+
+    # 2) localizar colunas
+    col_esteira = encontrar_coluna_esteira(df.columns)
+    col_pista   = encontrar_coluna_pista(df.columns)
+
+    if not col_esteira:
+        raise SystemExit(
+            f"Não encontrei a coluna de 'Esteira de Turbulência'. "
+            f"Colunas (normalizadas) disponíveis: {list(df.columns)[:12]} ..."
+        )
+
+    # 3) filtro de pista: remover 17P/35P (variações com espaço/caso)
+    if col_pista:
+        pista_norm = (df[col_pista]
+                      .astype(str).str.upper()
+                      .str.replace(" ", "", regex=False))
+        before = len(df)
+        df = df[~pista_norm.isin(["17P", "35P"])].copy()
+        removed = before - len(df)
+        print(f"Filtro de Pista aplicado ({col_pista}): removidos {removed} registros (17P/35P).")
+    else:
+        print("Aviso: coluna de Pista não encontrada; nenhum filtro 17P/35P aplicado.")
+
+    # 4) normalizar esteira e contabilizar
+    serie_norm = df[col_esteira].map(normalizar_valor_esteira)
+    total = len(serie_norm)
+    total_validos = int((serie_norm != "N/A").sum())
+
+    contagem = (serie_norm.value_counts(dropna=False)
+                .rename_axis("categoria")
+                .reset_index(name="qtde"))
+    contagem["percent_total_%"]  = 100.0 * contagem["qtde"] / max(total, 1)
+    contagem["percent_validos_%"] = 100.0 * contagem["qtde"] / max(total_validos, 1)
+
+    # 5) ordenar: J/H/M/L, depois OUTROS:*, depois N/A
+    ordem_base = {"J": 0, "H": 1, "M": 2, "L": 3}
+    def chave(cat):
+        if cat in ordem_base:               return (0, ordem_base[cat], cat)
+        if isinstance(cat, str) and cat.startswith("OUTROS:"): return (1, 10, cat)
+        if cat == "N/A":                    return (2, 99, cat)
+        return (1, 50, cat)
+
+    contagem["__ord"] = contagem["categoria"].map(chave)
+    contagem = contagem.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
+
+    # 6) imprimir
+    print("\n=== Mix de Esteira de Turbulência (excluindo 17P/35P) ===")
+    print(f"Arquivo: {ARQ}")
+    print(f"Coluna esteira: {col_esteira} | Coluna pista: {col_pista or '—'}")
+    print(f"Registros considerados: {total} | Válidos (≠ 'N/A'): {total_validos}\n")
+    print(contagem.to_string(index=False, formatters={
+        "percent_total_%":   lambda x: f"{x:6.2f}",
+        "percent_validos_%": lambda x: f"{x:6.2f}",
+    }))
+
+    # 7) salvar CSV
+    SAIDA_CSV.parent.mkdir(parents=True, exist_ok=True)
+    contagem.to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
+    print(f"\nOK: resultados salvos em {SAIDA_CSV}")
+
+    # 8) gráfico – percentuais sobre válidos
+    plt.figure(figsize=(10, 5))
+    plt.bar(contagem["categoria"], contagem["percent_validos_%"])
+    plt.title("Mix de Esteira de Turbulência (% sobre válidos) – excl. 17P/35P")
+    plt.xlabel("Categoria")
+    plt.ylabel("%")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.show()
