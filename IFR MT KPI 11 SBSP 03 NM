@@ -8,10 +8,10 @@ Ajuste: Regra 3 NM em pares mistos (SBSP–SBMT–SBSP)
 - Capacidade efetiva para SBSP: cap_sbsp = max(0, min(24 + 0.8*SBMT, 40) - SBMT)
 
 Gera:
-  (1) Gráfico – Dia 31/03/2024 (por hora, 06–23)
-      -> eixo x apenas horas cheias (6,7,...,23)
-  (2) Gráfico – Média por hora-do-dia (2024, dias úteis, RWY17) (06–23)
-      -> eixo x em inteiros de hora
+  (1) Gráficos – Dias 31/03/2024 e 25/04/2024 – janela 08→02 (ordem 08..23,00,01,02)
+      -> eixo x em horas cheias (formato %H)
+  (2) Gráfico – Média por hora-do-dia (2024, dias úteis, RWY17), janela 08..23,00..02
+      -> eixo x na ordem 08..23,00,01,02
 """
 
 from pathlib import Path
@@ -23,14 +23,18 @@ import csv, re, unicodedata
 # ===================== CONFIG =====================
 ARQ = Path(r"C:\Python\SBSP_2024_01_01_2024_12_31.csv")
 
-CAP_BASE = 24                     # capacidade base (5 NM) usada no denominador do KPI
-CAP_3NM_MAX = 40                  # teto físico se tudo fosse ~3 NM (headway ≈ 1.5 min)
-MISTO_EFIC = 1.0                  # fator de eficiência do ganho de mistura (0.7–1.0)
-GAIN_PER_SBMT = 0.8 * MISTO_EFIC  # ganho (slots/h) por cada SBMT/h
+CAP_BASE = 24                     # denominador fixo do KPI (5 NM)
+CAP_3NM_MAX = 40                  # teto físico (~3 NM -> ~40/h)
+MISTO_EFIC = 1.0                  # fator de eficiência do ganho (0.7–1.0)
+GAIN_PER_SBMT = 0.8 * MISTO_EFIC  # ganho de slots/h por cada SBMT/h
 
 SCENARIOS_SBMT = [0, 1, 2, 3, 4]
-DIA_ANALISE = "2024-03-31"
-HOD_MIN, HOD_MAX = 6, 23
+
+# Dias específicos (agora na janela 08→02)
+DIAS_ANALISE = ["2024-03-31", "2024-04-25"]
+
+# Ordem customizada para o agregado 08..23,00..02
+ORDEM_0802 = list(range(8,24)) + [0,1,2]
 
 # ===================== HELPERS =====================
 def sniff_delimiter_and_encoding(path, sample_bytes=1024*64):
@@ -69,30 +73,57 @@ def detectar_colunas(df):
     return col_tipo, col_pouso, col_pista
 
 def carregar_arr_hour_rwy17(ARQ: Path) -> pd.DataFrame:
+    """Lê, filtra ARR em RWY17 e agrega por HORA (toda a série 2024)."""
     sep, enc = sniff_delimiter_and_encoding(ARQ)
     df = pd.read_csv(ARQ, sep=sep, encoding=enc, dtype=str, engine="python", on_bad_lines="skip")
     df.columns = [norm_header(c) for c in df.columns]
     col_tipo, col_pouso, col_pista = detectar_colunas(df)
 
-    # chegadas
+    # chegadas e RWY 17 (17L/17R/17P)
     df = df[df[col_tipo].astype(str).str.strip().str.upper().eq("ARR")].copy()
-    # RWY 17
     pista = df[col_pista].astype(str).str.upper().str.replace(" ", "")
     df = df[pista.isin(["17L","17R","17P"])].copy()
 
-    # hora
+    # hora de pouso (normaliza e arredonda)
     df[col_pouso] = pd.to_datetime(df[col_pouso].astype(str).str.strip(),
                                    dayfirst=True, errors="coerce")
     df = df.dropna(subset=[col_pouso])
     df["hour"] = df[col_pouso].dt.floor("H")
 
+    # série por hora
     dfh = df.groupby("hour", as_index=False).size().rename(columns={"size":"arrivals_obs"})
     return dfh.sort_values("hour").reset_index(drop=True)
 
-# --------- NOVO: capacidade efetiva para SBSP com regra 3 NM em pares mistos ---------
+def prepara_horario_janela_0802(dfh_hour: pd.DataFrame, dia_str: str) -> pd.DataFrame:
+    """
+    Constrói a janela 08→02 em ordem cronológica:
+      - 08:00–23:00 do dia 'dia_str'
+      - 00:00–02:00 do dia seguinte
+    Retorna colunas: hour (datetime), arrivals_obs (int)
+    """
+    base_day = pd.to_datetime(dia_str)
+    next_day = base_day + pd.Timedelta(days=1)
+
+    d = dfh_hour.copy()
+    d["date"] = d["hour"].dt.strftime("%Y-%m-%d")
+    d["hod"]  = d["hour"].dt.hour
+
+    part1 = d[(d["date"] == dia_str) & (d["hod"] >= 8)]
+    part2 = d[(d["date"] == next_day.strftime("%Y-%m-%d")) & (d["hod"] <= 2)]
+    dd = pd.concat([part1, part2], ignore_index=True)
+
+    if dd.empty:
+        raise SystemExit(f"Não há dados para {dia_str} na janela 08→02.")
+
+    # Garante 1 linha por hora (caso existam múltiplas entradas)
+    dd = dd.groupby("hour", as_index=False)["arrivals_obs"].sum()
+    dd = dd.sort_values("hour").reset_index(drop=True)
+    return dd[["hour","arrivals_obs"]]
+
+# ----- Regra 3 NM: capacidade efetiva para SBSP com mistura -----
 def cap_sbsp_efetiva(sbmt_per_hour: int) -> float:
     """
-    Capacidade efetiva disponível para SBSP, em função de SBMT/h, considerando:
+    Capacidade efetiva disponível para SBSP, em função de SBMT/h:
       cap_combined = min(CAP_BASE + GAIN_PER_SBMT * SBMT, CAP_3NM_MAX)
       cap_sbsp     = max(0, cap_combined - SBMT)
     """
@@ -102,7 +133,7 @@ def cap_sbsp_efetiva(sbmt_per_hour: int) -> float:
     return max(0.0, cap_combined - sbmt_per_hour)
 
 def simular_servico_sbsp(dfh_hour: pd.DataFrame, sbmt_per_hour: int) -> pd.DataFrame:
-    """Atendimento por hora com backlog; KPI = (served/24)*100, com regra 3 NM."""
+    """Atendimento por hora com backlog; KPI = (served/24)*100, usando regra 3 NM."""
     cap_sbsp = cap_sbsp_efetiva(sbmt_per_hour)
     backlog = 0
     served_list, kpi_list = [], []
@@ -121,6 +152,7 @@ def simular_servico_sbsp(dfh_hour: pd.DataFrame, sbmt_per_hour: int) -> pd.DataF
     return out
 
 def media_horaria_dias_uteis_rwy17(dfh_hour: pd.DataFrame) -> pd.DataFrame:
+    """Média de chegadas observadas por hora-do-dia, apenas dias úteis."""
     d = dfh_hour.copy()
     d["dow"] = d["hour"].dt.dayofweek
     d = d[d["dow"] <= 4]
@@ -138,65 +170,81 @@ def anotar_medias(ax, labels, series):
 if __name__ == "__main__":
     dfh = carregar_arr_hour_rwy17(ARQ)
 
-    # --------- (1) KPI11 no dia específico (06–23) ---------
-    df_day0 = dfh.copy()
-    df_day0["hod"] = df_day0["hour"].dt.hour
-    df_day0 = df_day0[df_day0["hour"].dt.strftime("%Y-%m-%d") == DIA_ANALISE]
-    df_day0 = df_day0[(df_day0["hod"] >= HOD_MIN) & (df_day0["hod"] <= HOD_MAX)].reset_index(drop=True)
+    # --------- (1) KPI11 – DIAS ESPECÍFICOS, janela 08→02 ---------
+    for DIA_ANALISE in DIAS_ANALISE:
+        # prepara série 08→02
+        df_0802 = prepara_horario_janela_0802(dfh, DIA_ANALISE)
 
-    x = df_day0["hour"]
-    curves, labels = [], []
-    for s in SCENARIOS_SBMT:
-        res = simular_servico_sbsp(df_day0[["hour","arrivals_obs","hod"]], sbmt_per_hour=s)
-        curves.append(res["KPI11_percent"].values)
-        labels.append("Base (SBMT=0/h)" if s == 0 else f"{s} SBMT/h")
+        # ticks do eixo (08 até 02 do dia seguinte)
+        start_tick = pd.to_datetime(DIA_ANALISE) + pd.Timedelta(hours=8)
+        end_tick   = pd.to_datetime(DIA_ANALISE) + pd.Timedelta(days=1, hours=2)
+        ticks_0802 = pd.date_range(start_tick, end_tick, freq="H")
 
-    fig, ax = plt.subplots(figsize=(12,5))
-    # cenários 1..4
-    for y, lab in zip(curves[1:], labels[1:]):
-        ax.plot(x, y, marker="o", label=lab, linewidth=1.5)
-    # baseline destacado
-    ax.plot(x, curves[0], marker="o", label=labels[0],
-            color="blue", linewidth=3, linestyle="-")
+        # curvas por cenário
+        curvas, labels = [], []
+        for s in SCENARIOS_SBMT:
+            res = simular_servico_sbsp(df_0802.copy(), sbmt_per_hour=s)
+            curvas.append(res["KPI11_percent"].values)
+            labels.append("Base (SBMT=0/h)" if s == 0 else f"{s} SBMT/h")
 
-    ax.set_title(f"KPI11 por hora – {DIA_ANALISE} (RWY 17) – Regra 3 NM")
-    ax.set_xlabel("Hora")
-    ax.set_ylabel("KPI11 = (SBSP atendido / 24) × 100 (%)")
-    ax.legend(loc="upper left")
+        fig, ax = plt.subplots(figsize=(12,5))
+        # cenários 1..4
+        for y, lab in zip(curvas[1:], labels[1:]):
+            ax.plot(df_0802["hour"], y, marker="o", label=lab, linewidth=1.5)
+        # baseline destacado
+        ax.plot(df_0802["hour"], curvas[0], marker="o", label=labels[0],
+                color="blue", linewidth=3, linestyle="-")
 
-    # eixo apenas horas cheias
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H"))
-    plt.xticks(rotation=0)
+        ax.set_title(f"KPI11 por hora – {DIA_ANALISE} (RWY 17) – Regra 3 NM – Janela 08→02")
+        ax.set_xlabel("Hora")
+        ax.set_ylabel("KPI11 = (SBSP atendido / 24) × 100 (%)")
+        ax.legend(loc="upper left")
 
-    anotar_medias(ax, labels, curves)
-    plt.tight_layout()
-    plt.show()
+        # eixo apenas horas cheias, formatadas (%H) e na ordem 08..23,00..02
+        ax.set_xticks(ticks_0802)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H"))
+        plt.xticks(rotation=0)
 
-    # --------- (2) KPI11 médio por hora-do-dia (dias úteis, 06–23) ---------
+        anotar_medias(ax, labels, curvas)
+        plt.tight_layout()
+        plt.show()
+
+    # --------- (2) KPI11 MÉDIO – DIAS ÚTEIS, janela 08..23,00..02 ---------
+    ordem = ORDEM_0802
+    pos_map = {h:i for i,h in enumerate(ordem)}
+
     mean_hod = media_horaria_dias_uteis_rwy17(dfh)
-    mean_hod = mean_hod[(mean_hod["hod"] >= HOD_MIN) & (mean_hod["hod"] <= HOD_MAX)].reset_index(drop=True)
+    mean_hod = mean_hod[mean_hod["hod"].isin(ordem)].reset_index(drop=True)
 
-    x2 = mean_hod["hod"]
-    curves2, labels2 = [], []
+    # séries de KPI por cenário (capacidade efetiva por cenário, clipping por hora)
+    labels2 = []
     for s in SCENARIOS_SBMT:
         cap_eff_sbsp = cap_sbsp_efetiva(s)
         served = mean_hod["arrivals_obs"].clip(upper=cap_eff_sbsp)
-        kpi_series = (served / CAP_BASE) * 100.0
-        curves2.append(kpi_series.values)
+        mean_hod[f"KPI_{s}"] = (served / CAP_BASE) * 100.0
         labels2.append("Base (SBMT=0/h)" if s == 0 else f"{s} SBMT/h")
 
-    fig2, ax2 = plt.subplots(figsize=(12,5))
-    for y, lab in zip(curves2[1:], labels2[1:]):
-        ax2.plot(x2, y, marker="o", label=lab, linewidth=1.5)
-    ax2.plot(x2, curves2[0], marker="o", label=labels2[0],
+    # ordenar eixo na sequência 08..23,00..02
+    mean_hod["pos"] = mean_hod["hod"].map(pos_map)
+    mean_hod = mean_hod.sort_values("pos").reset_index(drop=True)
+
+    fig2, ax2 = plt.subplots(figsize=(14,5))
+    # cenários 1..4
+    for s, lab in zip(SCENARIOS_SBMT[1:], labels2[1:]):
+        ax2.plot(mean_hod["pos"], mean_hod[f"KPI_{s}"], marker="o", label=lab, linewidth=1.5)
+    # baseline
+    ax2.plot(mean_hod["pos"], mean_hod["KPI_0"], marker="o", label=labels2[0],
              color="blue", linewidth=3, linestyle="-")
 
-    ax2.set_title("KPI11 médio por hora-do-dia – 2024 (dias úteis, RWY 17) – Regra 3 NM")
+    ax2.set_title("KPI11 médio por hora-do-dia – 2024 (dias úteis, RWY 17) – Regra 3 NM – Janela 08..23,00..02")
     ax2.set_xlabel("Hora do dia")
     ax2.set_ylabel("KPI11 = (SBSP atendido / 24) × 100 (%)")
-    ax2.set_xticks(range(HOD_MIN, HOD_MAX+1))
+    ax2.set_xticks(list(range(len(ordem))))
+    ax2.set_xticklabels([f"{h:02d}" for h in ordem])
     ax2.legend(loc="upper left")
-    anotar_medias(ax2, labels2, curves2)
+
+    curvas_plot = [mean_hod[f"KPI_{s}"].values for s in SCENARIOS_SBMT]
+    anotar_medias(ax2, labels2, curvas_plot)
+
     plt.tight_layout()
     plt.show()
