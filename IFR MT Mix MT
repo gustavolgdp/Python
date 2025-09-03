@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+"""
+SBMT – Mix de Esteira de Turbulência (J/H/M/L/N/A) para Pistas 12/30
+Fonte: Excel  C:\Python\SBMT_2024_01_01_2024_12_31.xlsx
+
+O script:
+- Lê o .xlsx (todas as abas; escolhe a que contém as colunas necessárias)
+- Normaliza cabeçalhos
+- Normaliza 'Pista' (aceita '12', '30', 'RWY 12', '12/30', '12-30', etc.)
+- Diagnostica contagens e amostras (Pista/Esteira)
+- Escolhe coluna de Esteira por nome/por conteúdo
+- Calcula mix e salva CSV; plota gráfico
+
+Requer: pandas, openpyxl, matplotlib
+"""
+
+from pathlib import Path
+import pandas as pd
+import re, unicodedata
+import matplotlib.pyplot as plt
+
+# ============== CONFIG ==============
+ARQ_XLSX = Path(r"C:\Python\SBMT_2024_01_01_2024_12_31.xlsx")
+SAIDA_CSV = Path(r"C:\Python\sbmt_mix_esteira_12_30.xlsx.csv")
+TOP_N_AMOSTRAS = 12
+
+# ============ HELPERS ==============
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s)
+                   if unicodedata.category(c) != "Mn")
+
+def norm_header(s: str) -> str:
+    s = s.strip().replace("\u00A0", " ")
+    s = strip_accents(s)
+    s = re.sub(r"\s+", "_", s)
+    return s.lower()
+
+def normalize_rwy_any(x: str) -> list[str]:
+    """Extrai tokens de cabeceira (00–36) de formatos variados de 'Pista'."""
+    if pd.isna(x):
+        return []
+    s = str(x).upper().strip()
+    s = (s.replace("RUNWAY", " ")
+           .replace("PISTA", " ")
+           .replace("RWY", " ")
+           .replace("R", " "))
+    s = s.replace(" ", "")
+    tokens = re.findall(r"(\d{2})", s)
+    toks = [t for t in tokens if t.isdigit() and 0 <= int(t) <= 36]
+    # remover duplicatas mantendo ordem
+    seen, out = set(), []
+    for t in toks:
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+def normalizar_valor_esteira(v: str) -> str:
+    if pd.isna(v): return "N/A"
+    s = str(v).strip().upper()
+    s = (s.replace("SUPER", "J")
+           .replace("HEAVY", "H").replace("HVY", "H")
+           .replace("MEDIUM", "M").replace("MEDIO", "M").replace("MED", "M")
+           .replace("LIGHT", "L").replace("LEVE", "L").replace("LGT", "L").replace("LIG", "L"))
+    s = s.replace("J ", "J").replace("H ", "H").replace("M ", "M").replace("L ", "L")
+    if s in {"J","H","M","L"}: return s
+    if s in {"", "-", "NA", "N/A", "NULL", "NONE"}: return "N/A"
+    return f"OUTROS:{s}"
+
+def escolher_coluna_esteira(df: pd.DataFrame) -> tuple[str, float]:
+    """Prefere nomes prováveis; se ambíguo, decide por conteúdo (% que vira J/H/M/L)."""
+    preferidas = [
+        "esteira_de_turbulencia","esteira_turbulencia","esteira",
+        "wake_turbulence","categoria_esteira","cat_esteira","wtc"
+    ]
+    for c in preferidas:
+        if c in df.columns:
+            serie = df[c].map(normalizar_valor_esteira)
+            score = (serie.isin(["J","H","M","L"]).sum())/max(len(serie),1)
+            return c, score
+    melhor_col, melhor_score = None, -1.0
+    for col in df.columns:
+        try:
+            serie = df[col].map(normalizar_valor_esteira)
+            score = (serie.isin(["J","H","M","L"]).sum())/max(len(serie),1)
+            if score > melhor_score:
+                melhor_col, melhor_score = col, score
+        except Exception:
+            continue
+    return melhor_col, melhor_score
+
+def carregar_aba_valida(xlsx_path: Path) -> pd.DataFrame:
+    """Lê todas as abas, normaliza cabeçalhos e retorna a primeira que tem 'pista' e alguma coluna candidata de esteira."""
+    xls = pd.ExcelFile(xlsx_path, engine="openpyxl")
+    for nome in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=nome, dtype=str)
+        cols_orig = list(df.columns)
+        df.columns = [norm_header(c) for c in cols_orig]
+        # heurística: precisa ter pista e alguma coluna que pareça esteira
+        tem_pista = any(c in df.columns for c in ["pista","rwy","runway"])
+        tem_esteira = any(c in df.columns for c in
+                          ["esteira_de_turbulencia","esteira_turbulencia","esteira",
+                           "wake_turbulence","categoria_esteira","cat_esteira","wtc"])
+        if tem_pista or tem_esteira:
+            print(f"Aba selecionada: {nome}")
+            return df
+    # fallback: pega a primeira e normaliza
+    print("Aviso: não encontrei colunas evidentes; usando a primeira aba.")
+    df = pd.read_excel(xls, sheet_name=0, dtype=str)
+    df.columns = [norm_header(c) for c in df.columns]
+    return df
+
+# =============== MAIN =================
+if __name__ == "__main__":
+    if not ARQ_XLSX.exists():
+        raise SystemExit(f"Arquivo não encontrado: {ARQ_XLSX}")
+
+    df = carregar_aba_valida(ARQ_XLSX)
+    total_bruto = len(df)
+    print(f"\nArquivo: {ARQ_XLSX}")
+    print(f"Total de linhas (todas as abas): {total_bruto:,}")
+
+    # --- localizar coluna 'pista'
+    col_pista = None
+    for c in ["pista","rwy","runway"]:
+        if c in df.columns:
+            col_pista = c; break
+    if not col_pista:
+        for c in df.columns:
+            if "pista" in c or "runway" in c or c == "rwy":
+                col_pista = c; break
+    if not col_pista:
+        raise SystemExit("Não encontrei coluna de 'Pista' em nenhuma aba.")
+
+    print("\nTop valores CRUS em 'Pista':")
+    print(df[col_pista].value_counts(dropna=False).head(TOP_N_AMOSTRAS))
+
+    # --- normalizar pista e filtrar 12/30
+    pistas_norm = df[col_pista].map(normalize_rwy_any)
+    mask_12_30 = pistas_norm.apply(lambda lst: ("12" in lst) or ("30" in lst))
+    df_12_30 = df[mask_12_30].copy()
+    print(f"\nLinhas com Pista contendo 12 ou 30: {len(df_12_30):,}")
+
+    def token_label(lst):
+        if "12" in lst and "30" in lst: return "12&30"
+        if "12" in lst: return "12"
+        if "30" in lst: return "30"
+        return "OUTROS"
+    print("\nDistribuição após normalização (nas linhas mantidas):")
+    print(pistas_norm[mask_12_30].map(token_label).value_counts())
+
+    if df_12_30.empty:
+        raise SystemExit("Após filtrar 12/30, não restaram registros. Verifique a coluna de Pista no .xlsx.")
+
+    # --- escolher coluna de esteira e diagnosticar
+    col_esteira, score = escolher_coluna_esteira(df_12_30)
+    if not col_esteira:
+        raise SystemExit("Não consegui identificar a coluna de Esteira de Turbulência.")
+    print(f"\nColuna de esteira escolhida: '{col_esteira}' (score J/H/M/L = {score:.2%})")
+
+    print("\nTop valores CRUS na coluna de esteira escolhida:")
+    print(df_12_30[col_esteira].value_counts(dropna=False).head(TOP_N_AMOSTRAS))
+
+    # --- normalizar esteira e calcular mix
+    esteira_norm = df_12_30[col_esteira].map(normalizar_valor_esteira)
+    total = len(esteira_norm)
+    validos = int((esteira_norm != "N/A").sum())
+
+    mix = (esteira_norm.value_counts(dropna=False)
+           .rename_axis("categoria")
+           .reset_index(name="qtde"))
+    mix["percent_total_%"]   = 100.0 * mix["qtde"] / max(total, 1)
+    mix["percent_validos_%"] = 100.0 * mix["qtde"] / max(validos, 1)
+
+    ordem = {"J":0,"H":1,"M":2,"L":3}
+    def key(cat):
+        if cat in ordem: return (0, ordem[cat], cat)
+        if isinstance(cat,str) and cat.startswith("OUTROS:"): return (1,10,cat)
+        if cat == "N/A": return (2,99,cat)
+        return (1,50,cat)
+    mix["__ord"] = mix["categoria"].map(key)
+    mix = mix.sort_values("__ord").drop(columns="__ord").reset_index(drop=True)
+
+    print(f"\nRegistros considerados: {total:,} | Válidos (≠ 'N/A'): {validos:,}\n")
+    print(mix.to_string(index=False, formatters={
+        "percent_total_%":   lambda x: f"{x:6.2f}",
+        "percent_validos_%": lambda x: f"{x:6.2f}",
+    }))
+
+    # --- salvar CSV
+    SAIDA_CSV.parent.mkdir(parents=True, exist_ok=True)
+    mix.to_csv(SAIDA_CSV, index=False, encoding="utf-8-sig")
+    print(f"\nOK: resultados salvos em {SAIDA_CSV}")
+
+    # --- gráfico
+    plt.figure(figsize=(9.5,5))
+    plt.bar(mix["categoria"], mix["percent_validos_%"])
+    plt.title("SBMT 2024 – Mix de Esteira (% sobre válidos) – Pistas 12/30 (Excel)")
+    plt.xlabel("Categoria"); plt.ylabel("%")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout(); plt.show()
