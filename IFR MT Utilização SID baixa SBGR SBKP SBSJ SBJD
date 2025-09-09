@@ -1,0 +1,253 @@
+# -*- coding: utf-8 -*-
+"""
+Utilização de SIDs/Fixos – SBGR, SBKP, SBJD, SBSJ (2024/2025)
+Leitura padronizada em XLSX (ignora CSV)
+
+Regras:
+- SBGR: SID=EDLUT1A & FIXO in {UKBEV, GERTU}
+- SBKP: SID in {KONVI1B, KONVI1C, KONVI1D} (fixo livre)
+- SBJD: SID=KONVI1B (fixo livre)
+- SBSJ: IGNORA SID; FIXO=UKBEV (todos os voos)
+
+Gráficos: Ano, Mês, Dia do Ano (ticks 1º/mês), Dia da Semana, Faixa Horária (00–23)
+"""
+
+import os, re, glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# ========= CONFIG =========
+BASE_DIR = r"C:\Python"
+AIRPORTS = ["SBGR", "SBKP", "SBJD", "SBSJ"]
+
+COL_SID  = "SID utilizada"
+COL_FIXO = "Fixo de saída"
+COL_DEP  = "Decolagem"
+
+# fix_mode:
+#  - "IN": precisa bater SID e FIXO
+#  - "ALL": só SID (fixo livre)
+#  - "FIX_ONLY": ignora SID e filtra só por FIXO
+FILTERS = {
+    "SBGR": {"mode": "IN",       "sids": ["EDLUT1A"],                 "fixos": ["UKBEV", "GERTU"]},
+    "SBKP": {"mode": "ALL",      "sids": ["KONVI1B","KONVI1C","KONVI1D"], "fixos": []},
+    "SBJD": {"mode": "ALL",      "sids": ["KONVI1B"],                 "fixos": []},   # ⬅️ atualizado
+    "SBSJ": {"mode": "FIX_ONLY", "sids": [],                          "fixos": ["UKBEV"]},
+}
+
+AIRPORT_TITLES = {
+    "SBGR": "SBGR – Guarulhos",
+    "SBKP": "SBKP – Viracopos",
+    "SBJD": "SBJD – Jundiaí",
+    "SBSJ": "SBSJ – São José dos Campos",
+}
+
+WEEKDAY_ABBR_PT = {0: "SEG", 1: "TER", 2: "QUA", 3: "QUI", 4: "SEX", 5: "SÁB", 6: "DOM"}
+
+# ========= NORMALIZAÇÃO =========
+def key_norm(s):
+    if pd.isna(s): return np.nan
+    txt = str(s).strip().upper()
+    try:
+        from unidecode import unidecode
+        txt = unidecode(txt)
+    except Exception:
+        pass
+    txt = re.sub(r"\s+", " ", txt)
+    return re.sub(r"[ \-\/\.]", "", txt)
+
+# ========= LEITURA =========
+def find_latest_xlsx(prefix):
+    pats = [f"{prefix}_*.xlsx", f"{prefix}*.xlsx"]
+    for pat in pats:
+        hits = glob.glob(os.path.join(BASE_DIR, pat))
+        if hits:
+            hits = sorted(hits, key=lambda p: os.path.getmtime(p), reverse=True)
+            return hits[0]
+    return None
+
+def read_xlsx(path):
+    df = pd.read_excel(path, dtype=str)  # primeira aba
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    return df
+
+# ========= FILTRO =========
+def filter_airport(df, ap):
+    mode = FILTERS[ap]["mode"]
+    need = [COL_DEP]
+    if mode in ("IN", "ALL"):
+        need.append(COL_SID)
+    if mode in ("IN", "FIX_ONLY"):
+        need.append(COL_FIXO)
+
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        print(f"[AVISO][{ap}] Coluna(s) faltando: {', '.join(missing)}. Resultado = 0.")
+        return pd.DataFrame(columns=[COL_SID, COL_FIXO, COL_DEP])
+
+    mask = pd.Series(True, index=df.index)
+
+    if mode in ("IN", "ALL"):
+        sid_key = df[COL_SID].map(key_norm)
+        m = False
+        for v in FILTERS[ap]["sids"]:
+            m = m | (sid_key == key_norm(v))
+        mask = mask & m
+
+    if mode in ("IN", "FIX_ONLY"):
+        fix_key = df[COL_FIXO].map(key_norm)
+        m = False
+        for v in FILTERS[ap]["fixos"]:
+            m = m | (fix_key == key_norm(v))
+        mask = mask & m
+
+    cols = [COL_DEP]
+    if COL_SID in df.columns:  cols.insert(0, COL_SID)
+    if COL_FIXO in df.columns: cols.append(COL_FIXO)
+
+    out = df.loc[mask, cols].copy()
+    out[COL_DEP] = pd.to_datetime(out[COL_DEP], errors="coerce", dayfirst=True)
+    out = out[out[COL_DEP].notna()].copy()
+
+    print(f"[DEBUG][{ap}] filtrados: {len(out)} (modo={mode})")
+    return out
+
+# ========= ENRIQUECER / AGRUPAR =========
+def enrich_time(df):
+    dep = df[COL_DEP]
+    df = df.copy()
+    df["ANO"] = dep.dt.year.astype("Int64")
+    df["MES"] = dep.dt.month.astype("Int64")
+    df["DIA_DO_ANO"] = dep.dt.dayofyear.astype("Int64")
+    df["WEEKDAY_IDX"] = dep.dt.dayofweek.astype("Int64")
+    df["WEEKDAY_ABBR"] = df["WEEKDAY_IDX"].map(WEEKDAY_ABBR_PT)
+    df["HORA"] = dep.dt.hour.astype("Int64")
+    df["FAIXA_HORARIA"] = df["HORA"].map(lambda h: f"{int(h):02d}" if pd.notna(h) else np.nan)
+    return df
+
+def group_count(df, key):
+    if df.empty: return pd.Series(dtype="int64")
+    s = df.groupby(key).size()
+    if key in {"MES", "DIA_DO_ANO", "WEEKDAY_IDX"}:
+        s = s.sort_index()
+    if key == "FAIXA_HORARIA":
+        order = [f"{i:02d}" for i in range(24)]
+        s = s.reindex(order).fillna(0).astype(int)
+    return s
+
+# ========= PLOT =========
+def add_bar_labels(ax):
+    for p in ax.patches:
+        h = p.get_height()
+        if h > 0:
+            ax.annotate(f"{int(h)}", (p.get_x() + p.get_width()/2, h),
+                        ha="center", va="bottom", fontsize=9)
+
+def bar_ax(ax, series, title, xlabel="", ylabel="Movimentos", add_labels=True):
+    if series is None or len(series) == 0:
+        ax.text(0.5, 0.5, "Sem dados filtrados", ha="center", va="center", fontsize=10)
+        ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+        return
+    ax.bar(series.index.astype(str), series.values)
+    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    if len(series.index) > 12:
+        plt.setp(ax.get_xticklabels(), rotation=90)
+    else:
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    if add_labels: add_bar_labels(ax)
+
+def set_month_start_ticks(ax, is_leap=False):
+    ticks = [1, 32, 61, 92, 122, 153, 184, 215, 246, 276, 307, 337] if is_leap \
+            else [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
+    labels = ["JAN","FEV","MAR","ABR","MAI","JUN","JUL","AGO","SET","OUT","NOV","DEZ"]
+    ax.set_xticks(ticks); ax.set_xticklabels(labels, rotation=0)
+
+# ========= MAIN =========
+def main():
+    print(f"[INFO] Procurando XLSX em: {BASE_DIR}")
+    dfs_raw = {}
+
+    # 1) leitura
+    print("[1/5] Lendo arquivos…")
+    for ap in tqdm(AIRPORTS):
+        path = find_latest_xlsx(ap)
+        if not path:
+            print(f"[AVISO] XLSX não encontrado para {ap}. 0.")
+            dfs_raw[ap] = pd.DataFrame()
+            continue
+        try:
+            df = read_xlsx(path)
+            dfs_raw[ap] = df
+            print(f"  - {ap}: {len(df):,} linhas ({os.path.basename(path)})")
+        except Exception as e:
+            print(f"[ERRO] Falha lendo {ap}: {e}")
+            dfs_raw[ap] = pd.DataFrame()
+
+    # 2) filtro
+    print("[2/5] Aplicando filtros…")
+    dfs_sel = {}
+    for ap in tqdm(AIRPORTS):
+        dfs_sel[ap] = filter_airport(dfs_raw[ap], ap)
+
+    # 3) enriquecer
+    print("[3/5] Enriquecendo colunas temporais…")
+    for ap in AIRPORTS:
+        if not dfs_sel[ap].empty:
+            dfs_sel[ap] = enrich_time(dfs_sel[ap])
+
+    # 4) agregações
+    print("[4/5] Agregando…")
+    keys = ["ANO", "MES", "DIA_DO_ANO", "WEEKDAY_IDX", "FAIXA_HORARIA"]
+    agg = {ap: {k: group_count(dfs_sel[ap], k) for k in keys} for ap in AIRPORTS}
+
+    # 5) gráficos
+    print("[5/5] Plotando…")
+
+    # ANO
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+    for ax, ap in zip(axes.ravel(), AIRPORTS):
+        bar_ax(ax, agg[ap]["ANO"], f"{AIRPORT_TITLES[ap]} – por ANO", "Ano", add_labels=True)
+    fig.suptitle("Utilização (regras por aeroporto) por ANO", fontsize=14, fontweight="bold")
+
+    # MÊS
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+    for ax, ap in zip(axes.ravel(), AIRPORTS):
+        s = agg[ap]["MES"]; s.index = s.index.map(lambda m: f"{int(m):02d}" if pd.notna(m) else "")
+        bar_ax(ax, s, f"{AIRPORT_TITLES[ap]} – por MÊS", "Mês (01–12)", add_labels=True)
+    fig.suptitle("Utilização (regras por aeroporto) por MÊS", fontsize=14, fontweight="bold")
+
+    # DIA DO ANO
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+    for ax, ap in zip(axes.ravel(), AIRPORTS):
+        ser = agg[ap]["DIA_DO_ANO"]
+        bar_ax(ax, ser, f"{AIRPORT_TITLES[ap]} – por DIA DO ANO", "Dia do ano", add_labels=False)
+        is_leap = (ser.index.max() == 366) if len(ser) else False
+        set_month_start_ticks(ax, is_leap=is_leap)
+    fig.suptitle("Utilização (regras por aeroporto) por DIA DO ANO", fontsize=14, fontweight="bold")
+
+    # DIA DA SEMANA
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+    order = ["SEG","TER","QUA","QUI","SEX","SÁB","DOM"]
+    for ax, ap in zip(axes.ravel(), AIRPORTS):
+        s = agg[ap]["WEEKDAY_IDX"]
+        s.index = s.index.map(lambda i: WEEKDAY_ABBR_PT.get(int(i), str(i)) if pd.notna(i) else "")
+        s = s.reindex(order).fillna(0).astype(int)
+        bar_ax(ax, s, f"{AIRPORT_TITLES[ap]} – por DIA DA SEMANA", "Dia da semana", add_labels=True)
+    fig.suptitle("Utilização (regras por aeroporto) por DIA DA SEMANA", fontsize=14, fontweight="bold")
+
+    # FAIXA HORÁRIA
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
+    for ax, ap in zip(axes.ravel(), AIRPORTS):
+        s = agg[ap]["FAIXA_HORARIA"]
+        bar_ax(ax, s, f"{AIRPORT_TITLES[ap]} – por FAIXA HORÁRIA", "Hora (00–23)", add_labels=True)
+    fig.suptitle("Utilização (regras por aeroporto) por FAIXA HORÁRIA", fontsize=14, fontweight="bold")
+
+    print("\n[RESUMO] Totais filtrados por aeroporto:")
+    for ap in AIRPORTS:
+        print(f"  - {ap}: {len(dfs_sel[ap]):,}")
+
+if __name__ == "__main__":
+    main()
