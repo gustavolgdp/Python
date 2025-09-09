@@ -6,7 +6,7 @@ Leitura padronizada em XLSX (ignora CSV)
 Regras:
 - SBGR: SID=EDLUT1A & FIXO in {UKBEV, GERTU}
 - SBKP: SID in {KONVI1B, KONVI1C, KONVI1D} (fixo livre)
-- SBJD: SID=KONVI1B (fixo livre)
+- SBJD: SID=KONVI1B (fixo livre)   <-- agora aceita variações tipo 'KONVI 1B', 'KONVI1B (...)'
 - SBSJ: IGNORA SID; FIXO=UKBEV (todos os voos)
 
 Gráficos: Ano, Mês, Dia do Ano (ticks 1º/mês), Dia da Semana, Faixa Horária (00–23)
@@ -31,10 +31,10 @@ COL_DEP  = "Decolagem"
 #  - "ALL": só SID (fixo livre)
 #  - "FIX_ONLY": ignora SID e filtra só por FIXO
 FILTERS = {
-    "SBGR": {"mode": "IN",       "sids": ["EDLUT1A"],                 "fixos": ["UKBEV", "GERTU"]},
-    "SBKP": {"mode": "ALL",      "sids": ["KONVI1B","KONVI1C","KONVI1D"], "fixos": []},
-    "SBJD": {"mode": "ALL",      "sids": ["KONVI1B"],                 "fixos": []},   # ⬅️ atualizado
-    "SBSJ": {"mode": "FIX_ONLY", "sids": [],                          "fixos": ["UKBEV"]},
+    "SBGR": {"mode": "IN",       "sids": ["EDLUT1A"],                         "fixos": ["UKBEV", "GERTU"]},
+    "SBKP": {"mode": "ALL",      "sids": ["KONVI1B","KONVI1C","KONVI1D"],     "fixos": []},
+    "SBJD": {"mode": "ALL",      "sids": ["KONVI1B"],                         "fixos": []},  # <= atualizado
+    "SBSJ": {"mode": "FIX_ONLY", "sids": [],                                  "fixos": ["UKBEV"]},
 }
 
 AIRPORT_TITLES = {
@@ -58,6 +58,16 @@ def key_norm(s):
     txt = re.sub(r"\s+", " ", txt)
     return re.sub(r"[ \-\/\.]", "", txt)
 
+def match_sid_series(series_norm: pd.Series, targets: list[str]) -> pd.Series:
+    """Combina igualdade lógica OU prefixo lógico (resolve casos 'KONVI 1B', 'KONVI1B ...')."""
+    if series_norm.empty:
+        return pd.Series(False, index=series_norm.index)
+    mask = pd.Series(False, index=series_norm.index)
+    for t in targets:
+        tnorm = key_norm(t)
+        mask = mask | (series_norm == tnorm) | series_norm.str.startswith(tnorm, na=False)
+    return mask
+
 # ========= LEITURA =========
 def find_latest_xlsx(prefix):
     pats = [f"{prefix}_*.xlsx", f"{prefix}*.xlsx"]
@@ -69,7 +79,7 @@ def find_latest_xlsx(prefix):
     return None
 
 def read_xlsx(path):
-    df = pd.read_excel(path, dtype=str)  # primeira aba
+    df = pd.read_excel(path, dtype=str)  # primeira planilha
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
     return df
 
@@ -91,27 +101,35 @@ def filter_airport(df, ap):
 
     if mode in ("IN", "ALL"):
         sid_key = df[COL_SID].map(key_norm)
-        m = False
-        for v in FILTERS[ap]["sids"]:
-            m = m | (sid_key == key_norm(v))
-        mask = mask & m
+        mask_sid = match_sid_series(sid_key, FILTERS[ap]["sids"])
+        mask = mask & mask_sid
 
     if mode in ("IN", "FIX_ONLY"):
         fix_key = df[COL_FIXO].map(key_norm)
-        m = False
+        mask_fix = False
         for v in FILTERS[ap]["fixos"]:
-            m = m | (fix_key == key_norm(v))
-        mask = mask & m
+            mask_fix = mask_fix | (fix_key == key_norm(v))
+        mask = mask & mask_fix
 
     cols = [COL_DEP]
     if COL_SID in df.columns:  cols.insert(0, COL_SID)
-    if COL_FIXO in df.columns: cols.append(COL_FIXO)
+    if COL_FIXO in df.columns and mode in ("IN", "FIX_ONLY"): cols.append(COL_FIXO)
 
     out = df.loc[mask, cols].copy()
     out[COL_DEP] = pd.to_datetime(out[COL_DEP], errors="coerce", dayfirst=True)
     out = out[out[COL_DEP].notna()].copy()
 
-    print(f"[DEBUG][{ap}] filtrados: {len(out)} (modo={mode})")
+    # Logs úteis p/ validação rápida
+    if mode in ("IN", "ALL"):
+        tot_sid = int(match_sid_series(df[COL_SID].map(key_norm), FILTERS[ap]["sids"]).sum())
+    else:
+        tot_sid = "-"
+    if mode in ("IN", "FIX_ONLY"):
+        tot_fix = int((df[COL_FIXO].map(key_norm).isin([key_norm(x) for x in FILTERS[ap]["fixos"]])).sum())
+    else:
+        tot_fix = "-"
+    print(f"[DEBUG][{ap}] filtrados: {len(out)} | modo={mode} | hits_SID={tot_sid} | hits_FIXO={tot_fix}")
+
     return out
 
 # ========= ENRIQUECER / AGRUPAR =========
@@ -170,7 +188,7 @@ def main():
     print(f"[INFO] Procurando XLSX em: {BASE_DIR}")
     dfs_raw = {}
 
-    # 1) leitura
+    # 1) leitura XLSX
     print("[1/5] Lendo arquivos…")
     for ap in tqdm(AIRPORTS):
         path = find_latest_xlsx(ap)
@@ -219,16 +237,16 @@ def main():
         bar_ax(ax, s, f"{AIRPORT_TITLES[ap]} – por MÊS", "Mês (01–12)", add_labels=True)
     fig.suptitle("Utilização (regras por aeroporto) por MÊS", fontsize=14, fontweight="bold")
 
-    # DIA DO ANO
+    # DIA DO ANO (sem rótulos; ticks 1º/mês)
     fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
     for ax, ap in zip(axes.ravel(), AIRPORTS):
-        ser = agg[ap]["DIA_DO_ANO"]
-        bar_ax(ax, ser, f"{AIRPORT_TITLES[ap]} – por DIA DO ANO", "Dia do ano", add_labels=False)
-        is_leap = (ser.index.max() == 366) if len(ser) else False
+        series = agg[ap]["DIA_DO_ANO"]
+        bar_ax(ax, series, f"{AIRPORT_TITLES[ap]} – por DIA DO ANO", "Dia do ano", add_labels=False)
+        is_leap = (series.index.max() == 366) if len(series) else False
         set_month_start_ticks(ax, is_leap=is_leap)
     fig.suptitle("Utilização (regras por aeroporto) por DIA DO ANO", fontsize=14, fontweight="bold")
 
-    # DIA DA SEMANA
+    # DIA DA SEMANA (labels)
     fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
     order = ["SEG","TER","QUA","QUI","SEX","SÁB","DOM"]
     for ax, ap in zip(axes.ravel(), AIRPORTS):
@@ -238,7 +256,7 @@ def main():
         bar_ax(ax, s, f"{AIRPORT_TITLES[ap]} – por DIA DA SEMANA", "Dia da semana", add_labels=True)
     fig.suptitle("Utilização (regras por aeroporto) por DIA DA SEMANA", fontsize=14, fontweight="bold")
 
-    # FAIXA HORÁRIA
+    # FAIXA HORÁRIA (00–23, labels)
     fig, axes = plt.subplots(2, 2, figsize=(14, 8), constrained_layout=True)
     for ax, ap in zip(axes.ravel(), AIRPORTS):
         s = agg[ap]["FAIXA_HORARIA"]
