@@ -1,106 +1,278 @@
+# -*- coding: utf-8 -*-
+"""
+Dispensas médicas - Dia / Semana / Mês
+Leitura de conversa do WhatsApp e extração de 'X dia(s)'
+Período: 01/01/2025 a 31/08/2025
+Exibe gráficos no console (não salva em disco)
+
+Requisitos:
+    pip install pandas matplotlib tqdm
+"""
+
+import os
 import re
 from datetime import datetime
-import pandas as pd
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# === CONFIGURAÇÕES INICIAIS ===
-file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"  # ajuste o caminho se necessário
+import pandas as pd
+import matplotlib.pyplot as plt
 
-with open(file_path, encoding='utf-8') as f:
-    lines = f.readlines()
+# =========================
+# CONFIGURAÇÕES DO USUÁRIO
+# =========================
+CAMINHO_ARQUIVO = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"
 
-# === REGEX ATUALIZADAS ===
-data_regex = re.compile(r'^(\d{2}/\d{2}/\d{4}) \d{2}:\d{2} -')
-dias_regex = re.compile(r'(\d+)\s+dia[s]?\b', re.IGNORECASE)
-grad_nome_regex = re.compile(r'\b(1S|2S|3S|SO|CV)\s+[A-ZÁ-ÚÂ-ÛÃ-ÕÊ-ẼÉÍÓÚÇ][^\d\n-]{2,}', re.IGNORECASE)
+INICIO = pd.Timestamp("2025-01-01")
+FIM    = pd.Timestamp("2025-08-31")
 
-# === EXTRAÇÃO ===
-registros = []
-registros_detalhados = []
+FREQ_SEMANA = "W-MON"   # semanas iniciando na segunda
+FREQ_MES    = "MS"      # início do mês
 
-print("🔍 Processando dispensas entre 01/01 e 30/05/2025 (com nome limpo)...")
-for line in tqdm(lines, desc="Analisando linhas"):
-    data_match = data_regex.search(line)
-    if data_match:
-        try:
-            data = datetime.strptime(data_match.group(1), "%d/%m/%Y")
-            if not (datetime(2025, 1, 1) <= data <= datetime(2025, 5, 30)):
-                continue
-        except ValueError:
-            continue
+# Horas fixas por mês (constantes)
+HORAS_FERIAS_POR_MES = 1612.0
+HORAS_FADIGA_POR_MES = 4350.0  # gerenciamento de fadiga
 
-        dias_match = dias_regex.search(line)
-        nome_match = grad_nome_regex.search(line)
+# Meses abreviados em PT-BR
+MESES_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
 
-        if dias_match and nome_match:
-            try:
-                dias = int(dias_match.group(1))
-                nome = nome_match.group(0).strip()
-                nome = re.sub(r'[\-\–\:]', '', nome)         # remove traços e dois-pontos
-                nome = re.sub(r'\s+', ' ', nome)             # normaliza espaços
-                nome = nome.upper()[:2] + nome[2:].title()   # graduação em maiúsculas, nome formatado
-                registros.append((data, dias))
-                registros_detalhados.append((data, nome, dias))
-            except ValueError:
-                continue
 
-# === GRÁFICOS ===
-df = pd.DataFrame(registros, columns=["data", "dias"])
-df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
-df["mes"] = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
+def eh_inicio_mensagem(linha: str) -> bool:
+    return bool(re.match(r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2} - ", linha))
 
-por_dia = df.groupby("data")["dias"].sum().reset_index()
-por_semana = df.groupby("semana")["dias"].sum().reset_index()
-por_mes = df.groupby("mes")["dias"].sum().reset_index()
+def parse_cabecalho(linha: str):
+    m = re.match(r"^(\d{2}/\d{2}/\d{4} \d{2}:\d{2}) - (.*)$", linha)
+    if not m:
+        return None, linha
+    try:
+        ts = datetime.strptime(m.group(1), "%d/%m/%Y %H:%M")
+    except ValueError:
+        ts = None
+    return ts, m.group(2)
 
-# === GRÁFICO POR DIA ===
-plt.figure(figsize=(14, 5))
-plt.plot(por_dia["data"], por_dia["dias"], marker='o', color='purple')
-plt.fill_between(por_dia["data"], por_dia["dias"], color='violet', alpha=0.3)
-plt.title("Dias de Dispensa Médica por Dia (01/01 a 30/05/2025)")
-plt.xlabel("Data")
-plt.ylabel("Total de Dias")
-plt.grid(True)
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
+def extrair_dias(texto: str) -> int:
+    t = texto.lower().replace("<mídia oculta>", " ").replace("<midia oculta>", " ")
+    padrao = re.compile(r"(?<!\d)(\d{1,3})\s*dias?\b")
+    m = padrao.search(t)
+    return int(m.group(1)) if m else 0
 
-# === GRÁFICO POR SEMANA ===
-plt.figure(figsize=(12, 5))
-plt.plot(por_semana["semana"].astype(str), por_semana["dias"], marker='o', color='blue')
-plt.fill_between(por_semana["semana"].astype(str), por_semana["dias"], color='lightblue')
-plt.title("Dias de Dispensa Médica por Semana (01/01 a 30/05/2025)")
-plt.xlabel("Semana")
-plt.ylabel("Total de Dias")
-plt.grid(True)
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
+def consolidar_mensagens(caminho_arquivo: str) -> pd.DataFrame:
+    with open(caminho_arquivo, "r", encoding="utf-8", errors="ignore") as f:
+        linhas = f.readlines()
 
-# === GRÁFICO POR MÊS ===
-plt.figure(figsize=(10, 5))
-plt.plot(por_mes["mes"].astype(str), por_mes["dias"], marker='o', color='green')
-plt.fill_between(por_mes["mes"].astype(str), por_mes["dias"], color='lightgreen')
-plt.title("Dias de Dispensa Médica por Mês (01/01 a 30/05/2025)")
-plt.xlabel("Mês")
-plt.ylabel("Total de Dias")
-plt.grid(True)
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.show()
+    mensagens, msg_atual = [], []
+    for linha in linhas:
+        if eh_inicio_mensagem(linha):
+            if msg_atual:
+                mensagens.append("".join(msg_atual).strip())
+                msg_atual = []
+            msg_atual.append(linha)
+        else:
+            msg_atual.append(linha)
+    if msg_atual:
+        mensagens.append("".join(msg_atual).strip())
 
-# === TABELA DETALHADA POR PESSOA ===
-df_detalhado = pd.DataFrame(registros_detalhados, columns=["data", "nome", "dias"])
-df_detalhado["mes"] = df_detalhado["data"].dt.to_period("M").astype(str)
+    registros = []
+    for m in tqdm(mensagens, desc="Processando mensagens"):
+        primeira_linha = m.splitlines()[0]
+        ts, _ = parse_cabecalho(primeira_linha)
+        if ts:
+            q_dias = extrair_dias(m)
+            if q_dias > 0:
+                registros.append({"data": pd.Timestamp(ts.date()), "dias": q_dias})
 
-# Pivotar: pessoa x mês
-tabela_final = df_detalhado.pivot_table(index="nome", columns="mes", values="dias", aggfunc="sum", fill_value=0)
-tabela_final["Total"] = tabela_final.sum(axis=1)
-tabela_final.reset_index(inplace=True)
+    return pd.DataFrame(registros) if registros else pd.DataFrame(columns=["data", "dias"])
 
-# Exportar
-output_path = file_path.rsplit("\\", 1)[0] + "\\resumo_dispensas_por_pessoa.xlsx"
-tabela_final.to_excel(output_path, index=False)
+def filtrar_periodo(df: pd.DataFrame, inicio: pd.Timestamp, fim: pd.Timestamp) -> pd.DataFrame:
+    return df[(df["data"] >= inicio) & (df["data"] <= fim)].copy() if not df.empty else df
 
-print(f"\n📁 Arquivo Excel exportado para: {output_path}")
+def agregar_series(df: pd.DataFrame):
+    if df.empty:
+        idx_dia = pd.date_range(INICIO, FIM, freq="D")
+        s_dia = pd.Series(0, index=idx_dia, name="dias")
+        return s_dia, s_dia.resample(FREQ_SEMANA).sum(), s_dia.resample(FREQ_MES).sum()
+
+    s = df.set_index("data")["dias"].sort_index()
+    idx_dia = pd.date_range(INICIO, FIM, freq="D")
+    s_dia = s.groupby(level=0).sum().reindex(idx_dia, fill_value=0)
+    return s_dia, s_dia.resample(FREQ_SEMANA).sum(), s_dia.resample(FREQ_MES).sum()
+
+def _rotulos_meses_pt(index_ts: pd.DatetimeIndex):
+    return [f"{MESES_PT[dt.month - 1]}/{dt.year}" for dt in index_ts]
+
+def _add_media(ax, valor_media: float, label: str = "Média do período"):
+    """Desenha linha de média e adiciona à legenda."""
+    (linha_media,) = ax.plot([0, 1], [valor_media, valor_media], linestyle="--", linewidth=1.6,
+                             transform=ax.get_yaxis_transform(), label=label)
+    return linha_media
+
+
+# =========================
+# FUNÇÕES DE GRÁFICO
+# =========================
+def grafico_linha(serie: pd.Series, titulo: str, label_y: str):
+    plt.figure(figsize=(12, 5))
+    plt.plot(serie.index, serie.values, linewidth=2, label="Total")
+    media = float(pd.Series(serie.values).mean()) if len(serie) else 0.0
+    ax = plt.gca()
+    _add_media(ax, media)  # adiciona linha de média com legenda
+    plt.title(titulo)
+    plt.xlabel("Data")
+    plt.ylabel(label_y)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="upper right", frameon=True, framealpha=0.9)
+    plt.tight_layout()
+    plt.show()
+
+def grafico_mensal_barras_com_rotulos(serie_mensal: pd.Series,
+                                      titulo: str,
+                                      label_y: str = "Soma de dias de dispensa",
+                                      mostrar_media: bool = True,
+                                      fator: float = 1.0,
+                                      sufixo_rotulo: str = ""):
+    serie = serie_mensal.loc[(serie_mensal.index >= INICIO) & (serie_mensal.index <= FIM)]
+    valores = (serie.values * fator).astype(float)
+    media = valores.mean() if len(valores) > 0 else 0.0
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    meses_str = _rotulos_meses_pt(serie.index)
+    barras = ax.bar(meses_str, valores, label="Total")
+
+    # Rótulos nas barras (valor)
+    for rect, v in zip(barras, valores):
+        ax.annotate(f"{int(round(v))}{sufixo_rotulo}",
+                    xy=(rect.get_x() + rect.get_width()/2, rect.get_height()),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=10)
+
+    # Linha de média + legenda
+    if mostrar_media:
+        _add_media(ax, media)
+
+    ax.set_title(titulo)
+    ax.set_xlabel("Mês")
+    ax.set_ylabel(label_y)
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(0, max(valores) * 1.25 if len(valores) else 1)
+    ax.legend(loc="upper right", frameon=True, framealpha=0.9)
+    plt.tight_layout()
+    plt.show()
+
+def grafico_mensal_empilhado_horas(serie_mensal: pd.Series, titulo: str):
+    """
+    Gráfico mensal empilhado com três componentes:
+      - Dispensa médica (horas = dias × 8)
+      - Férias (constante/mês)
+      - Gerenciamento de fadiga (constante/mês)
+    Mostra linha de média dos TOTAIS no período e legenda limpa.
+    """
+    serie = serie_mensal.loc[(serie_mensal.index >= INICIO) & (serie_mensal.index <= FIM)]
+    meses_str = _rotulos_meses_pt(serie.index)
+
+    horas_dm   = (serie.values.astype(float) * 8.0)
+    horas_fer  = pd.Series(HORAS_FERIAS_POR_MES, index=serie.index, dtype=float).values
+    horas_fad  = pd.Series(HORAS_FADIGA_POR_MES, index=serie.index, dtype=float).values
+    totais     = horas_dm + horas_fer + horas_fad
+    media_tot  = totais.mean() if len(totais) else 0.0
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    # Barras empilhadas (ordem: DM -> Férias -> Fadiga)
+    barras_dm  = ax.bar(meses_str, horas_dm, label="Dispensa médica (horas)")
+    barras_fer = ax.bar(meses_str, horas_fer, bottom=horas_dm,
+                        label=f"Férias ({int(HORAS_FERIAS_POR_MES)} h/mês)")
+    barras_fad = ax.bar(meses_str, horas_fad, bottom=horas_dm + horas_fer,
+                        label=f"Gerenciamento de fadiga ({int(HORAS_FADIGA_POR_MES)} h/mês)")
+
+    # Rótulos dos segmentos (centrais)
+    for rect, v in zip(barras_dm, horas_dm):
+        ax.annotate(f"{int(round(v))} h",
+                    xy=(rect.get_x() + rect.get_width()/2, rect.get_height()/2),
+                    ha="center", va="center", fontsize=9, color="white")
+    for rect, base, v in zip(barras_fer, horas_dm, horas_fer):
+        ax.annotate(f"{int(round(v))} h",
+                    xy=(rect.get_x() + rect.get_width()/2, base + rect.get_height()/2),
+                    ha="center", va="center", fontsize=9, color="black")
+    for rect, base2, v in zip(barras_fad, horas_dm + horas_fer, horas_fad):
+        ax.annotate(f"{int(round(v))} h",
+                    xy=(rect.get_x() + rect.get_width()/2, base2 + rect.get_height()/2),
+                    ha="center", va="center", fontsize=9, color="black")
+
+    # Rótulo de total acima da coluna
+    for x, tot in enumerate(totais):
+        ax.annotate(f"Total: {int(round(tot))} h",
+                    xy=(x, tot),
+                    xytext=(0, 25), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    # Linha de média dos TOTAIS + legenda
+    _add_media(ax, media_tot, label="Média do período (total)")
+
+    ax.set_title(titulo)
+    ax.set_xlabel("Mês")
+    ax.set_ylabel("Horas")
+    ax.grid(axis="y", alpha=0.3)
+
+    # Legenda dentro do quadro (canto superior direito)
+    ax.legend(loc="upper right", frameon=True, framealpha=0.9, fontsize=10)
+
+    # Folga vertical
+    ax.set_ylim(0, max(totais) * 1.35 if len(totais) else 1)
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# EXECUÇÃO
+# =========================
+if __name__ == "__main__":
+    if not os.path.isfile(CAMINHO_ARQUIVO):
+        raise FileNotFoundError(f"Arquivo não encontrado em: {CAMINHO_ARQUIVO}")
+
+    print("Lendo e parseando conversa do WhatsApp...")
+    df_base = consolidar_mensagens(CAMINHO_ARQUIVO)
+    df = filtrar_periodo(df_base, INICIO, FIM)
+    s_dia, s_sem, s_mes = agregar_series(df)
+
+    print("\nRESUMO")
+    print(f"Período: {INICIO.date()} a {FIM.date()}")
+    print(f"Mensagens com dispensa detectadas: {len(df)}")
+    print(f"Soma total de dias: {int(s_dia.sum())}\n")
+
+    # 1) Linha - Dia (com média do período)
+    grafico_linha(s_dia,
+                  titulo=f"Dispensas médicas por DIA ({INICIO.date()} a {FIM.date()})",
+                  label_y="Dias de dispensa")
+
+    # 2) Linha - Semana (com média do período)
+    grafico_linha(s_sem,
+                  titulo=f"Dispensas médicas por SEMANA (ISO) ({INICIO.date()} a {FIM.date()})",
+                  label_y="Dias de dispensa")
+
+    # 3) Barras - Mês (dias) com média
+    grafico_mensal_barras_com_rotulos(
+        s_mes,
+        titulo="Dispensas médicas por MÊS (jan–ago/2025) com rótulos e média",
+        label_y="Dias de dispensa",
+        mostrar_media=True,
+        fator=1,
+        sufixo_rotulo=""
+    )
+
+    # 4) Barras - Mês (horas = dias × 8) com média
+    grafico_mensal_barras_com_rotulos(
+        s_mes,
+        titulo="Carga horária indisponível devido dispensa médica (jan–ago/2025)",
+        label_y="Horas indisponíveis",
+        mostrar_media=True,
+        fator=8,
+        sufixo_rotulo=" h"
+    )
+
+    # 5) Empilhado - Mês (DM × 8 + Férias + Fadiga) com média dos totais
+    grafico_mensal_empilhado_horas(
+        s_mes,
+        titulo="Carga horária indisponível devido a dispensa médica, férias e gerenciamento de fadiga (jan–ago/2025)"
+    )
