@@ -1,0 +1,34 @@
+# -*- coding: utf-8 -*-
+"""
+Leitura das 50 primeiras linhas da FATO_SETORIZACAO_30MIN
+Inclui colunas: DATA_HORA_RELATIVA, Q_CTR, Q_ASS, Q_COOR, Q_SPVS
+"""
+
+import os
+import pandas as pd
+
+# Caminhos de saída definidos no pipeline
+DELTA_DIR_FATO = r"C:\Output\delta\fato_setorizacao_30min"
+PARQ_DIR_FATO  = r"C:\Output\parquet\fato_setorizacao_30min"
+
+# Tentativa de leitura em Delta Lake
+df = None
+try:
+    from deltalake import DeltaTable
+    print("Lendo Delta Lake...")
+    dt = DeltaTable(DELTA_DIR_FATO)
+    df = dt.to_pandas()
+except Exception as e:
+    print(f"[Aviso] Não foi possível ler em Delta: {e}")
+    print("Tentando fallback em Parquet...")
+    import pyarrow.dataset as ds
+    dataset = ds.dataset(PARQ_DIR_FATO, format="parquet", partitioning="hive")
+    df = dataset.to_table().to_pandas()
+
+# Selecionar apenas colunas de interesse
+cols = ["ts","DATA_HORA_RELATIVA","Q_CTR","Q_ASS","Q_COOR","Q_SPVS"]
+df_sel = df[cols]
+
+# Exibir colunas e primeiras 50 linhas
+print("Colunas disponíveis:", df_sel.columns.tolist())
+print("\nPrimeiras 50 linhas:\n", df_sel.head(50))
