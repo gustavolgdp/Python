@@ -1,0 +1,272 @@
+# -*- coding: utf-8 -*-
+"""
+Consolidação PUPSI + SIATFM (APP-SP 2024) em janelas de 30 minutos.
+Entrada:  C:\BD\
+Saída:    C:\Output\delta\...  (preferencial)
+          C:\Output\parquet\... (fallback)
+Regras aplicadas:
+- DATA_HORA_RELATIVA (formato nDDDHhMm, ex: 1DOM0000, 1DOM0030)
+- Q_CTR: maior entre PUPSI e SIATFM na janela de 30 min
+- Q_ASS: maior entre PUPSI e regra (isolados T03,T05,T07,T12,T14; agrupamentos têm 1 assistente, exceto T06/T09)
+- Q_COOR: maior entre PUPSI e ceil(Q_CTR/5)
+- Q_SPVS: Manhã(05:45-13:45)=2; Tarde(13:45-21:15)=2; Pernoite(21:15-05:45)=1
+- AGRUPAMENTO|QT: frequências de agrupamentos normalizados (Sxx→Txx), ordenados internamente e entre grupos
+Inclui barras de progresso (tqdm).
+"""
+
+import os
+import math
+import re
+from datetime import datetime
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+# ----------------------------
+# CONFIGURAÇÕES DE ENTRADA/SAÍDA
+# ----------------------------
+ARQ_PUPSI  = r"C:\BD\SETORIZACAO_APP_SP_2024_01_01_2024_12_31_PUPSI.csv"
+ARQ_SIATFM = r"C:\BD\SETORIZACAO_APP_SP_2024_01_01_2024_12_31_SIATFM.xlsx"
+SIATFM_SHEET = "Agrupamentos_Setores"  # ajuste se necessário
+
+OUT_BASE = r"C:\Output"
+DELTA_DIR_FATO = os.path.join(OUT_BASE, "delta",   "fato_setorizacao_30min")
+DELTA_DIR_AGRP = os.path.join(OUT_BASE, "delta",   "fato_agrupamentos")
+PARQ_DIR_FATO  = os.path.join(OUT_BASE, "parquet", "fato_setorizacao_30min")
+PARQ_DIR_AGRP  = os.path.join(OUT_BASE, "parquet", "fato_agrupamentos")
+
+ANO = 2024
+
+# ----------------------------
+# FUNÇÕES AUXILIARES
+# ----------------------------
+def floor_30min(ts: pd.Timestamp) -> pd.Timestamp:
+    return ts.floor("30T")
+
+def ceil_30min(ts: pd.Timestamp) -> pd.Timestamp:
+    return ts if ts == ts.floor("30T") else (ts.floor("30T") + pd.Timedelta(minutes=30))
+
+def gerar_grade_30min(ano: int) -> pd.DatetimeIndex:
+    start = pd.Timestamp(f"{ano}-01-01 00:00:00")
+    end   = pd.Timestamp(f"{ano+1}-01-01 00:00:00")
+    return pd.date_range(start, end, freq="30T", inclusive="left")
+
+def turno_from_ts(ts: pd.Timestamp) -> str:
+    hm = ts.hour * 60 + ts.minute
+    if 5*60+45 <= hm < 13*60+45:
+        return "MANHA"
+    elif 13*60+45 <= hm < 21*60+15:
+        return "TARDE"
+    else:
+        return "PERNOITE"
+
+def spvs_from_turno(turno: str) -> int:
+    return 2 if turno in ("MANHA", "TARDE") else 1
+
+# DATA_HORA_RELATIVA: n + DDD + HHMM (ex.: 1DOM0000)
+WEEKDAY_ABBR = {0:"SEG", 1:"TER", 2:"QUA", 3:"QUI", 4:"SEX", 5:"SAB", 6:"DOM"}
+
+def sunday_index_of_year(ts: pd.Timestamp) -> int:
+    first_day    = pd.Timestamp(ts.year, 1, 1)
+    first_sunday = first_day + pd.Timedelta(days=(6 - first_day.weekday()) % 7)
+    delta_days   = (ts.normalize() - first_sunday.normalize()).days
+    idx = 1 + (delta_days // 7) if delta_days >= 0 else 1
+    return idx
+
+def data_hora_relativa(ts: pd.Timestamp) -> str:
+    n    = sunday_index_of_year(ts)
+    ddd  = WEEKDAY_ABBR[ts.weekday()]
+    hhmm = f"{ts.hour:02d}{ts.minute:02d}"
+    return f"{n}{ddd}{hhmm}"
+
+# Normalização de agrupamentos "(S01/S02),(S03)" → grupos ordenados; S→T
+SECTOR_PAT = re.compile(r"S(\d{2})|T(\d{2})", re.IGNORECASE)
+
+def normalize_grouping(agr: str) -> str:
+    if not isinstance(agr, str) or not agr.strip():
+        return ""
+    grupos = []
+    for g in re.findall(r"\((.*?)\)", agr):
+        setores = re.split(r"[\/,]+", g)
+        clean = []
+        for s in setores:
+            s = s.strip().upper()
+            m = SECTOR_PAT.search(s)
+            if m:
+                num = m.group(1) or m.group(2)
+                clean.append(f"T{num}")
+        if clean:
+            grupos.append(sorted(clean))
+    grupos = sorted(grupos, key=lambda x: (len(x), x))
+    grupos_txt = [f"({('/'.join(gr))})" for gr in grupos]
+    return ",".join(grupos_txt)
+
+def assistants_by_grouping(agr_norm: str) -> int:
+    if not agr_norm:
+        return 0
+    total = 0
+    for g in re.findall(r"\((.*?)\)", agr_norm):
+        setores = [s.strip().upper() for s in g.split("/") if s.strip()]
+        if len(setores) == 1:
+            if setores[0] in {"T03","T05","T07","T12","T14"}:
+                total += 1
+        else:
+            if set(setores) == {"T06","T09"}:
+                pass
+            else:
+                total += 1
+    return total
+
+def coordinators_rule(q_ctr: int) -> int:
+    return int(np.ceil((q_ctr or 0)/5.0))
+
+def parse_hhmm(x: str) -> str:
+    x = str(x).strip()
+    if ":" in x: 
+        return x
+    if len(x) == 4 and x.isdigit():
+        return f"{x[:2]}:{x[2:]}"
+    return x
+
+# ----------------------------
+# LEITURA DAS FONTES
+# ----------------------------
+print("Lendo PUPSI...")
+pupsi = pd.read_csv(ARQ_PUPSI, sep=";", dtype=str)
+for c in ["ANO","MES","DIA"]:
+    pupsi[c] = pd.to_numeric(pupsi[c], errors="coerce").astype("Int64").fillna(0).astype(int)
+
+pupsi["INICIO"] = pupsi["INICIO"].apply(parse_hhmm)
+pupsi["FIM"]    = pupsi["FIM"].apply(parse_hhmm)
+pupsi["DT_INI"] = pd.to_datetime(pupsi["ANO"].astype(str)+"-"+pupsi["MES"].astype(str).str.zfill(2)+"-"+pupsi["DIA"].astype(str).str.zfill(2)+" "+pupsi["INICIO"], errors="coerce")
+pupsi["DT_FIM"] = pd.to_datetime(pupsi["ANO"].astype(str)+"-"+pupsi["MES"].astype(str).str.zfill(2)+"-"+pupsi["DIA"].astype(str).str.zfill(2)+" "+pupsi["FIM"],    errors="coerce")
+
+mask_cross = pupsi["DT_FIM"] <= pupsi["DT_INI"]
+pupsi.loc[mask_cross, "DT_FIM"] = pupsi.loc[mask_cross, "DT_FIM"] + pd.Timedelta(days=1)
+
+for c in ["QT_CTR","QT_ASS","QT_COOR","QT_SPVS"]:
+    pupsi[c] = pd.to_numeric(pupsi[c], errors="coerce").fillna(0).astype(int)
+
+print("Lendo SIATFM...")
+si = pd.read_excel(ARQ_SIATFM, sheet_name=SIATFM_SHEET)
+si["INICIO"] = pd.to_datetime(si["INICIO"], errors="coerce", dayfirst=True)
+si["FIM"]    = pd.to_datetime(si["FIM"],    errors="coerce", dayfirst=True)
+
+si = si[(si["INICIO"].dt.year == ANO) | (si["FIM"].dt.year == ANO)]
+pupsi = pupsi[(pupsi["DT_INI"].dt.year == ANO) | (pupsi["DT_FIM"].dt.year == ANO)]
+
+si["AGRUP_NORM"] = si["AGRUPAMENTOS"].astype(str).apply(normalize_grouping)
+
+# ----------------------------
+# EXPANSÃO PARA JANELAS DE 30 MIN
+# ----------------------------
+print("Expandindo PUPSI em janelas de 30 min...")
+acc = {"ts":[], "Q_CTR_PUPSI":[], "Q_ASS_PUPSI":[], "Q_COOR_PUPSI":[], "Q_CTR_SI":[], "Q_ASS_SI":[], "Q_COOR_SI":[]}
+
+for _, r in tqdm(pupsi.iterrows(), total=len(pupsi)):
+    ini = floor_30min(r["DT_INI"])
+    fim = ceil_30min(r["DT_FIM"])
+    if pd.isna(ini) or pd.isna(fim) or ini >= fim:
+        continue
+    slots = pd.date_range(ini, fim, freq="30T", inclusive="left")
+    acc["ts"].extend(slots)
+    acc["Q_CTR_PUPSI"].extend([int(r["QT_CTR"])]*len(slots))
+    acc["Q_ASS_PUPSI"].extend([int(r["QT_ASS"])]*len(slots))
+    acc["Q_COOR_PUPSI"].extend([int(r["QT_COOR"])]*len(slots))
+    acc["Q_CTR_SI"].extend([np.nan]*len(slots))
+    acc["Q_ASS_SI"].extend([np.nan]*len(slots))
+    acc["Q_COOR_SI"].extend([np.nan]*len(slots))
+
+print("Expandindo SIATFM em janelas de 30 min (com regras de ASS/COOR)...")
+for _, r in tqdm(si.iterrows(), total=len(si)):
+    ini = floor_30min(r["INICIO"])
+    fim = ceil_30min(r["FIM"])
+    if pd.isna(ini) or pd.isna(fim) or ini >= fim:
+        continue
+    slots = pd.date_range(ini, fim, freq="30T", inclusive="left")
+    q_ctr_si      = int(r.get("QT_CONSOLES", 0) or 0)
+    q_ass_si_rule = assistants_by_grouping(r.get("AGRUP_NORM",""))
+    q_coor_si     = coordinators_rule(q_ctr_si)
+    acc["ts"].extend(slots)
+    acc["Q_CTR_PUPSI"].extend([np.nan]*len(slots))
+    acc["Q_ASS_PUPSI"].extend([np.nan]*len(slots))
+    acc["Q_COOR_PUPSI"].extend([np.nan]*len(slots))
+    acc["Q_CTR_SI"].extend([q_ctr_si]*len(slots))
+    acc["Q_ASS_SI"].extend([q_ass_si_rule]*len(slots))
+    acc["Q_COOR_SI"].extend([q_coor_si]*len(slots))
+
+expanded = pd.DataFrame(acc)
+grp = expanded.groupby("ts", as_index=False).agg({
+    "Q_CTR_PUPSI":"max",
+    "Q_ASS_PUPSI":"max",
+    "Q_COOR_PUPSI":"max",
+    "Q_CTR_SI":"max",
+    "Q_ASS_SI":"max",
+    "Q_COOR_SI":"max"
+})
+
+grp["Q_CTR"]  = grp[["Q_CTR_PUPSI","Q_CTR_SI"]].max(axis=1, skipna=True).fillna(0).astype(int)
+grp["Q_ASS"]  = grp[["Q_ASS_PUPSI","Q_ASS_SI"]].max(axis=1, skipna=True).fillna(0).astype(int)
+grp["Q_COOR"] = grp[["Q_COOR_PUPSI","Q_COOR_SI"]].max(axis=1, skipna=True).fillna(0).astype(int)
+
+grp["TURNO"]   = grp["ts"].apply(turno_from_ts)
+grp["Q_SPVS"]  = grp["TURNO"].apply(spvs_from_turno).astype(int)
+grp["DHR"]     = grp["ts"].apply(data_hora_relativa)  # DATA_HORA_RELATIVA
+
+grp["ano"] = grp["ts"].dt.year
+grp["mes"] = grp["ts"].dt.month
+grp["dia"] = grp["ts"].dt.day
+
+fato_30min = grp[["ts","DHR","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","TURNO","ano","mes","dia"]].rename(
+    columns={"DHR":"DATA_HORA_RELATIVA"}
+).sort_values("ts").reset_index(drop=True)
+
+# ----------------------------
+# TABELA AGRUPAMENTO | QT (frequência no ano)
+# ----------------------------
+agr_counts = (si["AGRUP_NORM"].dropna().loc[si["AGRUP_NORM"].str.len()>0]
+              .value_counts().reset_index())
+agr_counts.columns = ["AGRUPAMENTO","QT"]
+agr_counts["ano"] = ANO
+
+# ----------------------------
+# GRAVAÇÃO: DELTA (preferência) / PARQUET (fallback)
+# ----------------------------
+def try_write_delta(df: pd.DataFrame, out_dir: str, partition_cols=None) -> bool:
+    try:
+        from deltalake import write_deltalake  # pip install deltalake
+        os.makedirs(out_dir, exist_ok=True)
+        write_deltalake(
+            out_dir,
+            df,
+            partition_by=partition_cols or [],
+            mode="overwrite",
+            overwrite_schema=True
+        )
+        return True
+    except Exception as e:
+        print(f"[Aviso] Não foi possível gravar em Delta: {e}")
+        return False
+
+def write_parquet_partitioned(df: pd.DataFrame, out_dir: str, partition_cols=None):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    os.makedirs(out_dir, exist_ok=True)
+    table = pa.Table.from_pandas(df)
+    pq.write_to_dataset(table, root_path=out_dir, partition_cols=partition_cols or [])
+
+print("Gravando FATO_SETORIZACAO_30MIN...")
+ok_delta_fato = try_write_delta(fato_30min, DELTA_DIR_FATO, partition_cols=["ano","mes","dia"])
+if not ok_delta_fato:
+    print("Gravando em Parquet (fallback)...")
+    write_parquet_partitioned(fato_30min, PARQ_DIR_FATO, partition_cols=["ano","mes","dia"])
+
+print("Gravando FATO_AGRUPAMENTOS...")
+ok_delta_agr = try_write_delta(agr_counts, DELTA_DIR_AGRP, partition_cols=["ano"])
+if not ok_delta_agr:
+    print("Gravando em Parquet (fallback)...")
+    write_parquet_partitioned(agr_counts, PARQ_DIR_AGRP, partition_cols=["ano"])
+
+print("\nConcluído.")
+print(f"- Fato 30min em: {'Delta: ' + DELTA_DIR_FATO if ok_delta_fato else 'Parquet: ' + PARQ_DIR_FATO}")
+print(f"- Agrupamentos em: {'Delta: ' + DELTA_DIR_AGRP if ok_delta_agr else 'Parquet: ' + PARQ_DIR_AGRP}")
