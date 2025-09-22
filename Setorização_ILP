@@ -1,0 +1,210 @@
+# -*- coding: utf-8 -*-
+r"""
+Dimensionamento ótimo (ILP) a partir do Parquet, com barras de progresso.
+
+- Lê Parquet: C:\Output\parquet\fato_setorizacao_30min.parquet
+- Constrói demanda por slot (30 min):
+    * Manhã (05:45–13:45): 16 slots, por janela [s, s+30min)
+    * Tarde (13:45–21:15): 15 slots, por janela [s, s+30min)
+    * Pernoite (21:15–05:45): 17 slots (configuração fixa)
+- ILP minimiza nº pessoas com:
+    * blocos ON de 2/3/4 slots; gap >= 2 slots entre blocos (folga 1h)
+    * carga por pessoa: M/T: 8–11 slots (4–5,5h); P: 6–9 slots (3–4,5h)
+- Salva Excel em: C:\Output\dimensionamento_turnos_ATCO_otimizado.xlsx
+  Colunas: DATA_RELATIVA | DATA_CIVIL | Quantidade
+  Ordenado por DATA_CIVIL asc e, dentro do dia, M→T→P.
+"""
+
+import os
+import sys
+import pandas as pd
+from typing import List
+from tqdm import tqdm
+
+PARQUET_FATO = r"C:\Output\parquet\fato_setorizacao_30min.parquet"
+OUT_XLSX     = r"C:\Output\dimensionamento_turnos_ATCO_otimizado.xlsx"
+
+# --- deps ---
+try:
+    import pulp
+    from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpInteger, value
+    from pulp import PULP_CBC_CMD, GLPK_CMD, HiGHS_CMD
+except ImportError:
+    sys.exit("Instale 'pulp' (pip install pulp)")
+
+try:
+    import openpyxl  # engine Excel
+except ImportError:
+    sys.exit("Instale 'openpyxl' (pip install openpyxl)")
+
+# --- util calendário ---
+WEEKDAY_ABBR = {0:"SEG", 1:"TER", 2:"QUA", 3:"QUI", 4:"SEX", 5:"SAB", 6:"DOM"}
+TURNO_ORDER  = {"M":1, "T":2, "P":3}
+
+def week_index_from_year_start(ts: pd.Timestamp) -> int:
+    jan1 = pd.Timestamp(ts.year, 1, 1)
+    return 1 + int((ts.normalize() - jan1.normalize()).days // 7)
+
+def make_data_relativa_base(d: pd.Timestamp) -> str:
+    n   = week_index_from_year_start(d)
+    ddd = WEEKDAY_ABBR[d.weekday()]
+    return f"{n}{ddd}"
+
+# --- janelas ---
+def turno_windows_for_day(d: pd.Timestamp):
+    manha_ini = pd.Timestamp(d.year, d.month, d.day, 5, 45)
+    manha_fim = pd.Timestamp(d.year, d.month, d.day, 13, 45)  # 16 slots
+    tarde_ini = pd.Timestamp(d.year, d.month, d.day, 13, 45)
+    tarde_fim = pd.Timestamp(d.year, d.month, d.day, 21, 15)  # 15 slots
+    perno_ini = pd.Timestamp(d.year, d.month, d.day, 21, 15)
+    next_day  = d + pd.Timedelta(days=1)
+    perno_fim = pd.Timestamp(next_day.year, next_day.month, next_day.day, 5, 45)  # 17 slots
+    return (manha_ini, manha_fim), (tarde_ini, tarde_fim), (perno_ini, perno_fim)
+
+def slots_between(start: pd.Timestamp, end: pd.Timestamp) -> List[pd.Timestamp]:
+    return list(pd.date_range(start, end, freq="30min", inclusive="left"))
+
+# --- pernoite fixo (por hora -> slots) ---
+PERN_WEEKDAY = [18, 19, 18, 9, 7, 6, 2, 2, 2]
+PERN_SAT     = [14, 14, 14, 9, 7, 6, 2, 2, 2]
+PERN_SUN     = [18, 19, 18, 9, 7, 6, 2, 2, 2]
+
+def pernoite_vector_for_day(d: pd.Timestamp):
+    wd = d.weekday()  # 0=Seg..6=Dom
+    hours = PERN_SAT if wd == 5 else (PERN_SUN if wd == 6 else PERN_WEEKDAY)
+    vec18 = [v for v in hours for _ in (0,1)]  # 9 horas -> 18 slots
+    return vec18[1:18]  # descarta 1º slot parcial (21:15–21:45)
+
+# --- padrões factíveis ---
+def generate_patterns(num_slots: int, min_on: int, max_on: int):
+    ON_LENGTHS = [2,3,4]  # 1h, 1h30, 2h
+    MIN_GAP    = 2        # 1h folga
+    MAX_BLOCKS = 3
+    patterns = set()
+
+    def place_block(start_idx, blocks_used, current):
+        if blocks_used > MAX_BLOCKS: return
+        if sum(current) > max_on:    return
+        total_on = sum(current)
+        if blocks_used >= 1 and (min_on <= total_on <= max_on):
+            patterns.add(tuple(current))
+        if start_idx >= num_slots: return
+        i = start_idx
+        while i < num_slots:
+            for L in ON_LENGTHS:
+                end = i + L
+                if end > num_slots: continue
+                if any(current[j] == 1 for j in range(i, end)): continue
+                saved = current[i:end]
+                for j in range(i, end): current[j] = 1
+                next_start = end + MIN_GAP
+                place_block(next_start, blocks_used+1, current)
+                current[i:end] = saved
+            i += 1
+
+    place_block(0, 0, [0]*num_slots)
+    if not patterns:
+        base = [0]*num_slots
+        for s in range(0, num_slots-3):
+            p = base.copy()
+            for k in range(s, s+4): p[k] = 1
+            patterns.add(tuple(p))
+    return [list(p) for p in patterns]
+
+def pick_solver():
+    try: return PULP_CBC_CMD(msg=False)
+    except Exception: pass
+    try: return HiGHS_CMD(msg=False)
+    except Exception: pass
+    try: return GLPK_CMD(msg=False)
+    except Exception: pass
+    return None
+
+SOLVER = pick_solver()
+
+def solve_turn_demand(demand_slots, min_on, max_on):
+    demand_slots = [int(x) if pd.notna(x) and x >= 0 else 0 for x in demand_slots]
+    N = len(demand_slots)
+    patterns = generate_patterns(N, min_on, max_on)
+
+    model = LpProblem("CoberturaTurno", LpMinimize)
+    x = [LpVariable(f"x_{i}", lowBound=0, cat=LpInteger) for i in range(len(patterns))]
+    model += lpSum(x)
+    for t in range(N):
+        model += lpSum(x[i] * patterns[i][t] for i in range(len(patterns))) >= demand_slots[t]
+
+    if SOLVER is not None: model.solve(SOLVER)
+    else:                   model.solve()
+
+    status = pulp.LpStatus[model.status]
+    if status not in ("Optimal", "Feasible"):
+        raise RuntimeError(f"Solver retornou status '{status}'.")
+    return int(sum(int(value(var)) for var in x))
+
+# --- leitura do Parquet e preparação ---
+if not os.path.isfile(PARQUET_FATO):
+    sys.exit(f"Parquet não encontrado: {PARQUET_FATO}")
+
+tqdm.write("Lendo Parquet...")
+df = pd.read_parquet(PARQUET_FATO)
+need = {"ts","Q_CTR","Q_ASS","Q_COOR","TURNO","DATA_RELATIVA"}
+missing = need - set(df.columns)
+if missing:
+    sys.exit(f"Colunas ausentes no Parquet: {sorted(missing)}")
+
+df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+df = df.dropna(subset=["ts"]).copy()
+df["Q_ATCO"] = df["Q_CTR"].fillna(0).astype(int) + df["Q_ASS"].fillna(0).astype(int) + df["Q_COOR"].fillna(0).astype(int)
+df_idx = df.set_index("ts").sortindex() if hasattr(pd.DataFrame, "sortindex") else df.set_index("ts").sort_index()
+
+def window_max(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    if start >= end: return 0
+    seg = df_idx.loc[start:end - pd.Timedelta(microseconds=1)]
+    if seg.empty: return 0
+    return int(seg["Q_ATCO"].max(skipna=True) or 0)
+
+min_day = df_idx.index.min().normalize()
+max_day = df_idx.index.max().normalize()
+all_days = pd.date_range(min_day, max_day, freq="D")
+
+rows = []
+
+# Barra de progresso principal (dias)
+for d in tqdm(all_days, desc="Dimensionando dias", unit="dia"):
+    (mi, mf), (ti, tf), (pi, pf) = turno_windows_for_day(d)
+
+    slots_m = slots_between(mi, mf)
+    slots_t = slots_between(ti, tf)
+
+    # Sub-barras (turnos) - exibem mensagens rápidas
+    dem_m = [window_max(s, s + pd.Timedelta(minutes=30)) for s in slots_m]
+    qtd_m = solve_turn_demand(dem_m, min_on=8, max_on=11)
+    tqdm.write(f"{d.date()} - Manhã OK")
+
+    dem_t = [window_max(s, s + pd.Timedelta(minutes=30)) for s in slots_t]
+    qtd_t = solve_turn_demand(dem_t, min_on=8, max_on=11)
+    tqdm.write(f"{d.date()} - Tarde OK")
+
+    dem_p = pernoite_vector_for_day(d)
+    qtd_p = solve_turn_demand(dem_p, min_on=6, max_on=9)
+    tqdm.write(f"{d.date()} - Pernoite OK")
+
+    base = make_data_relativa_base(d)
+    rows.append((base + "M", d.date(), qtd_m))
+    rows.append((base + "T", d.date(), qtd_t))
+    rows.append((base + "P", d.date(), qtd_p))
+
+resultado = pd.DataFrame(rows, columns=["DATA_RELATIVA", "DATA_CIVIL", "Quantidade"])
+
+# Ordenação final: data civil asc e, no dia, M→T→P
+resultado["__tur_ord__"] = resultado["DATA_RELATIVA"].str[-1].map(TURNO_ORDER).fillna(9).astype(int)
+resultado = resultado.sort_values(["DATA_CIVIL","__tur_ord__"]).drop(columns=["__tur_ord__"]).reset_index(drop=True)
+
+# Salvar Excel
+os.makedirs(os.path.dirname(OUT_XLSX), exist_ok=True)
+with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as w:
+    resultado.to_excel(w, sheet_name="Dimensionamento_ILP", index=False)
+
+tqdm.write("Amostra (primeiras 24 linhas):")
+tqdm.write(resultado.head(24).to_string(index=False))
+tqdm.write(f"Excel salvo em: {OUT_XLSX}")
