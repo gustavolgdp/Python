@@ -1,0 +1,58 @@
+# -*- coding: utf-8 -*-
+"""
+Leitura (apenas Delta Lake) da FATO_SETORIZACAO_30MIN
+Mostra as 50 primeiras linhas com: ts, DATA_HORA_RELATIVA, Q_CTR, Q_ASS, Q_COOR, Q_SPVS
+"""
+
+import os
+import sys
+
+DELTA_DIR_FATO = r"C:\Output\delta\fato_setorizacao_30min"
+
+def main():
+    # Verificações iniciais
+    if not os.path.isdir(DELTA_DIR_FATO):
+        sys.exit(f"Erro: pasta não encontrada: {DELTA_DIR_FATO}")
+
+    delta_log = os.path.join(DELTA_DIR_FATO, "_delta_log")
+    if not os.path.isdir(delta_log):
+        sys.exit(
+            "Erro: não é uma tabela Delta válida (faltando pasta _delta_log).\n"
+            "Dica: reprocese a escrita em Delta, verifique se o pipeline não caiu no fallback Parquet."
+        )
+
+    try:
+        from deltalake import DeltaTable
+    except ImportError:
+        sys.exit("Pacote 'deltalake' não encontrado. Instale com: pip install deltalake")
+
+    # Carregar a tabela Delta
+    dt = DeltaTable(DELTA_DIR_FATO)
+
+    # Informações úteis
+    print(f"Tabela Delta: {DELTA_DIR_FATO}")
+    try:
+        print("Versão atual:", dt.version())
+    except Exception as e:
+        print(f"(Aviso) Não foi possível ler a versão: {e}")
+
+    # Para pandas
+    try:
+        df = dt.to_pandas()
+    except Exception as e:
+        sys.exit(f"Falha ao converter para pandas: {e}")
+
+    # Conferir colunas disponíveis e selecionar as desejadas
+    cols_desejadas = ["ts", "DATA_HORA_RELATIVA", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS"]
+    faltantes = [c for c in cols_desejadas if c not in df.columns]
+    if faltantes:
+        print("Colunas encontradas:", df.columns.tolist())
+        sys.exit(f"Erro: colunas ausentes na tabela: {faltantes}")
+
+    # Exibir as 50 primeiras linhas
+    preview = df[cols_desejadas].head(50)
+    print("\nPrimeiras 50 linhas (Delta):")
+    print(preview.to_string(index=False))
+
+if __name__ == "__main__":
+    main()
