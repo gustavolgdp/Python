@@ -1,0 +1,70 @@
+# -*- coding: utf-8 -*-
+r"""
+ETL: Delta -> Parquet (FATO_SETORIZACAO_30MIN) com barra de progresso.
+
+- Lê Delta em C:\Output\delta\fato_setorizacao_30min
+- Recalcula DATA_RELATIVA (semana começa em 01/jan do ano):
+    * DATA_RELATIVA = n + DDD + HHMM, ex.: 1QUA0000
+- Mantém: ts, DATA_RELATIVA, Q_CTR, Q_ASS, Q_COOR, Q_SPVS, TURNO
+- Salva Parquet em: C:\Output\parquet\fato_setorizacao_30min.parquet
+"""
+
+import os
+import sys
+import pandas as pd
+from tqdm import tqdm
+
+DELTA_DIR   = r"C:\Output\delta\fato_setorizacao_30min"
+OUT_PARQUET = r"C:\Output\parquet\fato_setorizacao_30min.parquet"
+
+WEEKDAY_ABBR = {0:"SEG", 1:"TER", 2:"QUA", 3:"QUI", 4:"SEX", 5:"SAB", 6:"DOM"}
+
+def week_index_from_year_start(ts: pd.Timestamp) -> int:
+    jan1 = pd.Timestamp(ts.year, 1, 1)
+    return 1 + int((ts.normalize() - jan1.normalize()).days // 7)
+
+def make_data_relativa(ts: pd.Timestamp) -> str:
+    n   = week_index_from_year_start(ts)
+    ddd = WEEKDAY_ABBR[ts.weekday()]
+    hhmm = f"{ts.hour:02d}{ts.minute:02d}"
+    return f"{n}{ddd}{hhmm}"
+
+try:
+    from deltalake import DeltaTable
+except ImportError:
+    sys.exit("Instale 'deltalake' (pip install deltalake)")
+
+if not (os.path.isdir(DELTA_DIR) and os.path.isdir(os.path.join(DELTA_DIR, "_delta_log"))):
+    sys.exit("Caminho Delta inválido (falta _delta_log).")
+
+# Leitura
+tqdm.write("Lendo Delta...")
+dt = DeltaTable(DELTA_DIR)
+df = dt.to_pandas()
+
+# Checagens
+need = {"ts", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "TURNO"}
+missing = need - set(df.columns)
+if missing:
+    sys.exit(f"Colunas ausentes na Delta: {sorted(missing)}")
+
+# Preparação
+df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+df = df.dropna(subset=["ts"]).copy()
+
+# DATA_RELATIVA com progresso
+tqdm.pandas(desc="Gerando DATA_RELATIVA")
+df["DATA_RELATIVA"] = df["ts"].progress_apply(make_data_relativa)
+
+# Ordenar (opcional)
+df = df.sort_values("ts")
+
+# Gravar
+os.makedirs(os.path.dirname(OUT_PARQUET), exist_ok=True)
+tqdm.write("Gravando Parquet...")
+df.to_parquet(OUT_PARQUET, engine="pyarrow", index=False)
+tqdm.write(f"OK! Parquet salvo em: {OUT_PARQUET}")
+
+# Amostra
+tqdm.write(df[["ts","DATA_RELATIVA","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","TURNO"]]
+           .head(8).to_string(index=False))
