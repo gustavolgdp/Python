@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 r"""
-ETL: Delta -> Parquet (FATO_SETORIZACAO_30MIN) com barra de progresso.
+ETL: Delta -> Parquet (FATO_SETORIZACAO_30MIN), com Polars (vetorizado) e multithread.
 
-- Lê Delta em C:\Output\delta\fato_setorizacao_30min
+- Lê Delta em: C:\Output\delta\fato_setorizacao_30min
 - Recalcula DATA_RELATIVA (semana começa em 01/jan do ano):
     * DATA_RELATIVA = n + DDD + HHMM, ex.: 1QUA0000
 - Mantém: ts, DATA_RELATIVA, Q_CTR, Q_ASS, Q_COOR, Q_SPVS, TURNO
@@ -11,60 +11,95 @@ ETL: Delta -> Parquet (FATO_SETORIZACAO_30MIN) com barra de progresso.
 
 import os
 import sys
-import pandas as pd
 from tqdm import tqdm
 
+# ---------- CONFIG ----------
 DELTA_DIR   = r"C:\Output\delta\fato_setorizacao_30min"
 OUT_PARQUET = r"C:\Output\parquet\fato_setorizacao_30min.parquet"
 
-WEEKDAY_ABBR = {0:"SEG", 1:"TER", 2:"QUA", 3:"QUI", 4:"SEX", 5:"SAB", 6:"DOM"}
+# os.environ["POLARS_MAX_THREADS"] = "8"  # (opcional) limitar threads
 
-def week_index_from_year_start(ts: pd.Timestamp) -> int:
-    jan1 = pd.Timestamp(ts.year, 1, 1)
-    return 1 + int((ts.normalize() - jan1.normalize()).days // 7)
-
-def make_data_relativa(ts: pd.Timestamp) -> str:
-    n   = week_index_from_year_start(ts)
-    ddd = WEEKDAY_ABBR[ts.weekday()]
-    hhmm = f"{ts.hour:02d}{ts.minute:02d}"
-    return f"{n}{ddd}{hhmm}"
+# ---------- IMPORTS ----------
+try:
+    import polars as pl
+except Exception as e:
+    sys.exit(f"Erro ao importar polars: {e}\nInstale com: pip install polars")
 
 try:
     from deltalake import DeltaTable
-except ImportError:
-    sys.exit("Instale 'deltalake' (pip install deltalake)")
+except Exception as e:
+    sys.exit(f"Erro ao importar deltalake: {e}\nInstale com: pip install deltalake")
 
+try:
+    import pyarrow as pa  # noqa
+except Exception as e:
+    sys.exit(f"Erro ao importar pyarrow: {e}\nInstale com: pip install pyarrow")
+
+# ---------- VALID ----------
 if not (os.path.isdir(DELTA_DIR) and os.path.isdir(os.path.join(DELTA_DIR, "_delta_log"))):
-    sys.exit("Caminho Delta inválido (falta _delta_log).")
+    sys.exit("Caminho Delta inválido (verifique se existe e se contém a pasta _delta_log).")
 
-# Leitura
-tqdm.write("Lendo Delta...")
+NEEDED_COLS = {"ts", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "TURNO"}
+WEEKDAY_ABBR = ["SEG", "TER", "QUA", "QUI", "SEX", "SAB", "DOM"]  # 0..6
+
+# ---------- READ DELTA -> ARROW -> POLARS ----------
+tqdm.write("Lendo Delta (delta-rs) ...")
 dt = DeltaTable(DELTA_DIR)
-df = dt.to_pandas()
+arrow_tbl = dt.to_pyarrow_table()
+df = pl.from_arrow(arrow_tbl)
 
-# Checagens
-need = {"ts", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "TURNO"}
-missing = need - set(df.columns)
+missing = NEEDED_COLS - set(df.columns)
 if missing:
     sys.exit(f"Colunas ausentes na Delta: {sorted(missing)}")
 
-# Preparação
-df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-df = df.dropna(subset=["ts"]).copy()
+# ---------- TYPE CAST ts ----------
+tqdm.write("Convertendo 'ts' para datetime e removendo nulos...")
+ts_dtype = df.schema["ts"]
+if ts_dtype == pl.Utf8:
+    # Preferência: str.strptime; fallback para str.to_datetime
+    try:
+        df = df.with_columns(pl.col("ts").str.strptime(pl.Datetime, strict=False).alias("ts"))
+    except Exception:
+        df = df.with_columns(pl.col("ts").str.to_datetime(strict=False).alias("ts"))
+elif ts_dtype != pl.Datetime:
+    df = df.with_columns(pl.col("ts").cast(pl.Datetime).alias("ts"))
 
-# DATA_RELATIVA com progresso
-tqdm.pandas(desc="Gerando DATA_RELATIVA")
-df["DATA_RELATIVA"] = df["ts"].progress_apply(make_data_relativa)
+df = df.drop_nulls(subset=["ts"])
 
-# Ordenar (opcional)
-df = df.sort_values("ts")
+# ---------- DATA_RELATIVA (vetorizado) ----------
+tqdm.write("Gerando DATA_RELATIVA (Polars vetorizado)...")
+df = df.with_columns([
+    (1 + ((pl.col("ts").dt.ordinal_day() - 1) // 7)).alias("SEMANA_ANO_INICIO_01JAN"),
+    pl.col("ts").dt.weekday().alias("WDN"),          # 0..6 (seg..dom)
+    pl.col("ts").dt.strftime("%H%M").alias("HHMM"),
+])
 
-# Gravar
+df = df.with_columns(
+    pl.when(pl.col("WDN") == 0).then(pl.lit(WEEKDAY_ABBR[0]))
+     .when(pl.col("WDN") == 1).then(pl.lit(WEEKDAY_ABBR[1]))
+     .when(pl.col("WDN") == 2).then(pl.lit(WEEKDAY_ABBR[2]))
+     .when(pl.col("WDN") == 3).then(pl.lit(WEEKDAY_ABBR[3]))
+     .when(pl.col("WDN") == 4).then(pl.lit(WEEKDAY_ABBR[4]))
+     .when(pl.col("WDN") == 5).then(pl.lit(WEEKDAY_ABBR[5]))
+     .otherwise(pl.lit(WEEKDAY_ABBR[6]))
+     .alias("DDD")
+)
+
+df = df.with_columns(
+    (pl.col("SEMANA_ANO_INICIO_01JAN").cast(pl.Utf8) + pl.col("DDD") + pl.col("HHMM")).alias("DATA_RELATIVA")
+)
+
+# ---------- ORDER & SELECT ----------
+tqdm.write("Ordenando por 'ts'...")
+df = df.sort("ts")
+
+df_out = df.select(["ts", "DATA_RELATIVA", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "TURNO"])
+
+# ---------- WRITE PARQUET ----------
+tqdm.write("Gravando Parquet (compressão ZSTD)...")
 os.makedirs(os.path.dirname(OUT_PARQUET), exist_ok=True)
-tqdm.write("Gravando Parquet...")
-df.to_parquet(OUT_PARQUET, engine="pyarrow", index=False)
-tqdm.write(f"OK! Parquet salvo em: {OUT_PARQUET}")
+df_out.write_parquet(OUT_PARQUET, compression="zstd", statistics=True)
 
-# Amostra
-tqdm.write(df[["ts","DATA_RELATIVA","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","TURNO"]]
-           .head(8).to_string(index=False))
+tqdm.write(f"OK! Parquet salvo em: {OUT_PARQUET}")
+tqdm.write("Amostra das primeiras linhas:")
+tqdm.write(df_out.head(8).to_pandas().to_string(index=False))
