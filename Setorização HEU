@@ -1,145 +1,179 @@
 # -*- coding: utf-8 -*-
 r"""
-Dimensionamento HEURÍSTICO (rápido) a partir do Parquet.
+Dimensionamento HEURÍSTICO (rápido) com Polars — CORRIGIDO
 
-Ideia:
-- Para cada turno do dia, calcular o pico (máximo) de demanda por slot de 30 min.
-- Quantidade de pessoas ≈ ceil( fator_cobertura * pico ).
-  * fator_cobertura default = 1.5 (equivale a ~2h on / 1h off)
-
-Turnos:
-- Manhã   : 05:45–13:45 (16 slots)   [demanda pelas janelas [s, s+30min) do Parquet]
-- Tarde   : 13:45–21:15 (15 slots)   [idem]
-- Pernoite: 21:15–05:45 (17 slots)   [usa configuração fixa abaixo, já convertida p/ 30 min]
+- Lê Parquet: C:\Output\parquet\fato_setorizacao_30min.parquet
+- Agrega demanda por slots de 30 min usando group_by_dynamic com offset="15m"
+  (chaves = início da janela: ...:15 e ...:45 → cobre 05:45, 13:45, 21:15)
+- Para cada dia:
+    * Manhã   05:45–13:45 (16 slots) -> usa MAX por slot
+    * Tarde   13:45–21:15 (15 slots) -> usa MAX por slot
+    * Pernoite 21:15–05:45 (17 slots) -> CONFIGURAÇÃO FIXA (atualizada)
+- Quantidade ≈ ceil(fator * pico(turno))
+- Imprime as 20 primeiras linhas e salva Excel.
 
 Saída:
-- C:\Output\dimensionamento_turnos_ATCO_heuristica.xlsx com:
-  DATA_RELATIVA | DATA_CIVIL | Quantidade (ordenado por DATA_CIVIL e, dentro do dia, M→T→P)
-
-Obs.: É uma aproximação. Para mínimo garantido de pessoas com restrições de carga/folga por pessoa,
-use o script ILP.
+- C:\Output\dimensionamento_turnos_ATCO_heuristica.xlsx
+  (DATA_RELATIVA | DATA_CIVIL | Quantidade, ordenado por DATA_CIVIL e M→T→P)
 """
 
-import os
-import sys
-import math
-import pandas as pd
+import os, sys, math, datetime as dt
 from typing import List
 from tqdm import tqdm
 
-# --------- Caminhos / parâmetros ----------
 PARQUET_FATO = r"C:\Output\parquet\fato_setorizacao_30min.parquet"
 OUT_XLSX     = r"C:\Output\dimensionamento_turnos_ATCO_heuristica.xlsx"
 
-# Fatores de cobertura (você pode ajustar separado por turno, se quiser)
-FACTOR_M = 1.5   # manhã
-FACTOR_T = 1.5   # tarde
-FACTOR_P = 1.5   # pernoite
+# Fatores de cobertura (ajuste conforme desejar)
+FACTOR_M = 1.5
+FACTOR_T = 1.5
+FACTOR_P = 1.5
 
-# --------- Calendário / rótulos ----------
 WEEKDAY_ABBR = {0:"SEG", 1:"TER", 2:"QUA", 3:"QUI", 4:"SEX", 5:"SAB", 6:"DOM"}
 TURNO_ORDER  = {"M":1, "T":2, "P":3}
 
-def week_index_from_year_start(ts: pd.Timestamp) -> int:
-    jan1 = pd.Timestamp(ts.year, 1, 1)
-    return 1 + int((ts.normalize() - jan1.normalize()).days // 7)
-
-def make_data_relativa_base(d: pd.Timestamp) -> str:
-    n   = week_index_from_year_start(d)
-    ddd = WEEKDAY_ABBR[d.weekday()]
-    return f"{n}{ddd}"
-
-# --------- Janelas e slots ----------
-def turno_windows_for_day(d: pd.Timestamp):
-    manha_ini = pd.Timestamp(d.year, d.month, d.day, 5, 45)
-    manha_fim = pd.Timestamp(d.year, d.month, d.day, 13, 45)  # 16 slots
-    tarde_ini = pd.Timestamp(d.year, d.month, d.day, 13, 45)
-    tarde_fim = pd.Timestamp(d.year, d.month, d.day, 21, 15)  # 15 slots
-    perno_ini = pd.Timestamp(d.year, d.month, d.day, 21, 15)
-    next_day  = d + pd.Timedelta(days=1)
-    perno_fim = pd.Timestamp(next_day.year, next_day.month, next_day.day, 5, 45)  # 17 slots
-    return (manha_ini, manha_fim), (tarde_ini, tarde_fim), (perno_ini, perno_fim)
-
-def slots_between(start: pd.Timestamp, end: pd.Timestamp) -> List[pd.Timestamp]:
-    return list(pd.date_range(start, end, freq="30min", inclusive="left"))
-
-# --------- Pernoite FIXO (semanal/sábado/domingo)  ----------
-# Cada número é por HORA CHEIA: 21–22, 22–23, 23–00, 00–01, 01–02, 02–03, 03–04, 04–05, 05–06
+# Pernoite FIXO (21–22, 22–23, 23–00, 00–01, 01–02, 02–03, 03–04, 04–05, 05–06)
 PERN_WEEKDAY = [14, 14, 3, 3, 2, 2, 2, 6, 8]   # Seg–Sex
 PERN_SAT     = [11,  7, 4, 3, 2, 2, 2, 4, 4]   # Sábado
 PERN_SUN     = [20, 13, 4, 3, 2, 2, 2, 5, 7]   # Domingo
 
-def pernoite_vector_for_day(d: pd.Timestamp):
-    wd = d.weekday()  # 0=Seg..6=Dom
+def pernoite_vector_for_day(d: dt.date):
+    wd = d.weekday()
     hours = PERN_SAT if wd == 5 else (PERN_SUN if wd == 6 else PERN_WEEKDAY)
-    vec18 = [v for v in hours for _ in (0,1)]      # 9h → 18 slots de 30 min
-    return vec18[1:18]                              # descarta 1º slot parcial (21:15–21:45) → 17 slots
+    vec18 = [v for v in hours for _ in (0,1)]  # 9h -> 18 slots
+    return vec18[1:18]                          # descarta 21:15–21:45 -> 17 slots
 
-# --------- Leitura base ----------
+def week_index_from_year_start(date_obj: dt.date) -> int:
+    jan1 = dt.date(date_obj.year, 1, 1)
+    return 1 + (date_obj - jan1).days // 7
+
+def make_data_relativa_base(date_obj: dt.date) -> str:
+    n = week_index_from_year_start(date_obj)
+    ddd = WEEKDAY_ABBR[date_obj.weekday()]
+    return f"{n}{ddd}"
+
+def turno_windows_for_day(d: dt.date):
+    y,m,day = d.year, d.month, d.day
+    manha_ini = dt.datetime(y,m,day,5,45)
+    manha_fim = dt.datetime(y,m,day,13,45)  # 16 slots
+    tarde_ini = dt.datetime(y,m,day,13,45)
+    tarde_fim = dt.datetime(y,m,day,21,15)  # 15 slots
+    perno_ini = dt.datetime(y,m,day,21,15)
+    perno_fim = (dt.datetime(y,m,day) + dt.timedelta(days=1)).replace(hour=5, minute=45)  # 17 slots
+    return (manha_ini, manha_fim), (tarde_ini, tarde_fim), (perno_ini, perno_fim)
+
+def slots_between(start: dt.datetime, end: dt.datetime) -> List[dt.datetime]:
+    out, cur = [], start
+    step = dt.timedelta(minutes=30)
+    while cur < end:
+        out.append(cur)
+        cur += step
+    return out
+
+# ---- libs ----
+try:
+    import polars as pl
+except Exception as e:
+    sys.exit(f"Instale 'polars': {e}")
+try:
+    import openpyxl  # para escrever xlsx
+except Exception as e:
+    sys.exit(f"Instale 'openpyxl': {e}")
+import pandas as pd  # apenas para salvar o Excel
+
+# ---- leitura Parquet ----
 if not os.path.isfile(PARQUET_FATO):
     sys.exit(f"Parquet não encontrado: {PARQUET_FATO}")
 
-tqdm.write("Lendo Parquet...")
-df = pd.read_parquet(PARQUET_FATO)
+tqdm.write("Lendo Parquet com Polars...")
+df = pl.read_parquet(PARQUET_FATO)
+
 need = {"ts","Q_CTR","Q_ASS","Q_COOR"}
 missing = need - set(df.columns)
 if missing:
-    sys.exit(f"Colunas ausentes no Parquet: {sorted(missing)}")
+    sys.exit(f"Colunas ausentes: {sorted(missing)}")
 
-df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-df = df.dropna(subset=["ts"]).copy()
-df["Q_ATCO"] = df["Q_CTR"].fillna(0).astype(int) + df["Q_ASS"].fillna(0).astype(int) + df["Q_COOR"].fillna(0).astype(int)
-df_idx = df.set_index("ts").sort_index()
+# ts -> Datetime (robusto)
+ts_dtype = df.schema["ts"]
+if ts_dtype == pl.Utf8:
+    try:
+        df = df.with_columns(pl.col("ts").str.strptime(pl.Datetime, strict=False).alias("ts"))
+    except Exception:
+        df = df.with_columns(pl.col("ts").str.to_datetime(strict=False).alias("ts"))
+elif ts_dtype != pl.Datetime:
+    df = df.with_columns(pl.col("ts").cast(pl.Datetime).alias("ts"))
 
-def window_max(start: pd.Timestamp, end: pd.Timestamp) -> int:
-    if start >= end: return 0
-    seg = df_idx.loc[start:end - pd.Timedelta(microseconds=1)]
-    if seg.empty: return 0
-    return int(seg["Q_ATCO"].max(skipna=True) or 0)
+df = df.drop_nulls(subset=["ts"])
 
-# --------- Loop dias ----------
-min_day = df_idx.index.min().normalize()
-max_day = df_idx.index.max().normalize()
-all_days = pd.date_range(min_day, max_day, freq="D")
+# Q_ATCO
+df = df.with_columns(
+    (pl.col("Q_CTR").fill_null(0).cast(pl.Int64) +
+     pl.col("Q_ASS").fill_null(0).cast(pl.Int64) +
+     pl.col("Q_COOR").fill_null(0).cast(pl.Int64)).alias("Q_ATCO")
+)
 
+# >>> Agregação correta por slots [s, s+30) com chaves em :15 e :45 <<<
+demanda = (df
+    .group_by_dynamic(
+        index_column="ts",
+        every="30m",
+        period="30m",
+        offset="15m",  # âncora em :15 → chaves 05:45, 13:45, 21:15 etc.
+        label="left"
+    )
+    .agg(pl.max("Q_ATCO").alias("demanda"))
+    .sort("ts")
+    .rename({"ts":"slot_start"})
+)
+
+min_day = demanda["slot_start"].min().date()
+max_day = demanda["slot_start"].max().date()
+slot_map = dict(zip(demanda["slot_start"], demanda["demanda"]))
+
+# ---- loop de dias (compatível com qualquer versão de Polars) ----
 rows = []
+current = min_day
+while current <= max_day:
+    d = current
+    (mi, mf), (ti, tf), _ = turno_windows_for_day(d)
 
-for d in tqdm(all_days, desc="Heurística - dias", unit="dia"):
-    (mi, mf), (ti, tf), (pi, pf) = turno_windows_for_day(d)
-
-    # Manhã
     slots_m = slots_between(mi, mf)
-    dem_m = [window_max(s, s + pd.Timedelta(minutes=30)) for s in slots_m]
-    pico_m = max(dem_m) if dem_m else 0
-    qtd_m  = int(math.ceil(FACTOR_M * pico_m))
-
-    # Tarde
     slots_t = slots_between(ti, tf)
-    dem_t = [window_max(s, s + pd.Timedelta(minutes=30)) for s in slots_t]
-    pico_t = max(dem_t) if dem_t else 0
-    qtd_t  = int(math.ceil(FACTOR_T * pico_t))
 
-    # Pernoite (fixo)
+    dem_m = [slot_map.get(s, 0) for s in slots_m]
+    dem_t = [slot_map.get(s, 0) for s in slots_t]
     dem_p = pernoite_vector_for_day(d)
+
+    pico_m = max(dem_m) if dem_m else 0
+    pico_t = max(dem_t) if dem_t else 0
     pico_p = max(dem_p) if dem_p else 0
-    qtd_p  = int(math.ceil(FACTOR_P * pico_p))
+
+    qtd_m = int(math.ceil(FACTOR_M * pico_m))
+    qtd_t = int(math.ceil(FACTOR_T * pico_t))
+    qtd_p = int(math.ceil(FACTOR_P * pico_p))
 
     base = make_data_relativa_base(d)
-    rows.append((base + "M", d.date(), qtd_m))
-    rows.append((base + "T", d.date(), qtd_t))
-    rows.append((base + "P", d.date(), qtd_p))
+    rows.append((base + "M", d, qtd_m))
+    rows.append((base + "T", d, qtd_t))
+    rows.append((base + "P", d, qtd_p))
 
-resultado = pd.DataFrame(rows, columns=["DATA_RELATIVA", "DATA_CIVIL", "Quantidade"])
+    current += dt.timedelta(days=1)
 
-# Ordenação final: DATA_CIVIL asc e, no dia, M→T→P
-resultado["__tur_ord__"] = resultado["DATA_RELATIVA"].str[-1].map(TURNO_ORDER).fillna(9).astype(int)
-resultado = resultado.sort_values(["DATA_CIVIL","__tur_ord__"]).drop(columns=["__tur_ord__"]).reset_index(drop=True)
+# ---- ordenar e salvar ----
+out = pl.DataFrame(rows, schema=["DATA_RELATIVA","DATA_CIVIL","Quantidade"]).with_columns([
+    pl.col("DATA_RELATIVA").str.slice(-1,1).alias("__turno_letter")
+]).with_columns([
+    pl.when(pl.col("__turno_letter")=="M").then(1)
+     .when(pl.col("__turno_letter")=="T").then(2)
+     .otherwise(3).alias("__tur_ord__")
+]).sort(["DATA_CIVIL","__tur_ord__"]).drop(["__turno_letter","__tur_ord__"])
 
-# --------- Grava Excel ----------
+# imprime 20 primeiras linhas
+tqdm.write("Amostra (20 primeiras linhas):")
+tqdm.write(out.head(20).to_pandas().to_string(index=False))
+
 os.makedirs(os.path.dirname(OUT_XLSX), exist_ok=True)
 with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as w:
-    resultado.to_excel(w, sheet_name="Dimensionamento_Heuristico", index=False)
+    out.to_pandas().to_excel(w, sheet_name="Dimensionamento_Heuristico", index=False)
 
-tqdm.write("Amostra (primeiras 24 linhas):")
-tqdm.write(resultado.head(24).to_string(index=False))
 tqdm.write(f"Excel salvo em: {OUT_XLSX}")
