@@ -1,105 +1,326 @@
 # -*- coding: utf-8 -*-
 r"""
-ETL: Delta -> Parquet (FATO_SETORIZACAO_30MIN), com Polars (vetorizado) e multithread.
+ETL_SETORIZACAO_MINUTE
+----------------------
+Expande INICIO–FIM (SIATFM/PUPSI) minuto a minuto por interseção real (sem extrapolar),
+usando join_asof (sem cross join), e agrega STRICT para 30min.
 
-- Lê Delta em: C:\Output\delta\fato_setorizacao_30min
-- Recalcula DATA_RELATIVA (semana começa em 01/jan do ano):
-    * DATA_RELATIVA = n + DDD + HHMM, ex.: 1QUA0000
-- Mantém: ts, DATA_RELATIVA, Q_CTR, Q_ASS, Q_COOR, Q_SPVS, TURNO
-- Salva Parquet em: C:\Output\parquet\fato_setorizacao_30min.parquet
+Alterações pedidas:
+- Ignorar QT_CONSOLES do SIATFM para o cálculo final.
+- Calcular QT_CONSOLES = Q_CTR + Q_COOR + Q_SPVS.
+- Adicionar Q_POS = Q_CTR + Q_ASS + Q_COOR + Q_SPVS.
+- No 30min, agregar os componentes e recomputar as derivadas.
+
+Saídas:
+  C:\Output\parquet\fato_setorizacao_min.parquet
+  C:\Output\parquet\fato_setorizacao_30min_strict.parquet
 """
 
-import os
-import sys
+import os, sys, datetime as dt
 from tqdm import tqdm
 
-# ---------- CONFIG ----------
-DELTA_DIR   = r"C:\Output\delta\fato_setorizacao_30min"
-OUT_PARQUET = r"C:\Output\parquet\fato_setorizacao_30min.parquet"
+# -------- CONFIG --------
+ARQ_SIATFM = r"C:\BD\SETORIZACAO_APP_SP_2024_01_01_2024_12_31_SIATFM.xlsx"
+ARQ_PUPSI  = r"C:\BD\SETORIZACAO_APP_SP_2024_01_01_2024_12_31_PUPSI.csv"
 
-# os.environ["POLARS_MAX_THREADS"] = "8"  # (opcional) limitar threads
+OUT_MINUTE = r"C:\Output\parquet\fato_setorizacao_min.parquet"
+OUT_30MIN  = r"C:\Output\parquet\fato_setorizacao_30min_strict.parquet"
 
-# ---------- IMPORTS ----------
+# -------- LIBS --------
 try:
     import polars as pl
 except Exception as e:
-    sys.exit(f"Erro ao importar polars: {e}\nInstale com: pip install polars")
-
+    sys.exit(f"Instale 'polars': {e}")
 try:
-    from deltalake import DeltaTable
+    import pandas as pd
 except Exception as e:
-    sys.exit(f"Erro ao importar deltalake: {e}\nInstale com: pip install deltalake")
+    sys.exit(f"Instale 'pandas': {e}")
 
-try:
-    import pyarrow as pa  # noqa
-except Exception as e:
-    sys.exit(f"Erro ao importar pyarrow: {e}\nInstale com: pip install pyarrow")
+# -------- HELPERS --------
+def normalize_cols(df: pl.DataFrame) -> dict:
+    return {c.lower().strip(): c for c in df.columns}
 
-# ---------- VALID ----------
-if not (os.path.isdir(DELTA_DIR) and os.path.isdir(os.path.join(DELTA_DIR, "_delta_log"))):
-    sys.exit("Caminho Delta inválido (verifique se existe e se contém a pasta _delta_log).")
+def ensure_datetime_infer(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    if col not in df.columns:
+        return df
+    dtp = df.schema[col]
+    if dtp == pl.Utf8:
+        try:
+            return df.with_columns(pl.col(col).str.strptime(pl.Datetime, strict=False).alias(col))
+        except Exception:
+            try:
+                return df.with_columns(pl.col(col).str.to_datetime(strict=False).alias(col))
+            except Exception:
+                pass
+    elif dtp != pl.Datetime:
+        try:
+            return df.with_columns(pl.col(col).cast(pl.Datetime).alias(col))
+        except Exception:
+            pass
+    return df
 
-NEEDED_COLS = {"ts", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "TURNO"}
-WEEKDAY_ABBR = ["SEG", "TER", "QUA", "QUI", "SEX", "SAB", "DOM"]  # 0..6
-
-# ---------- READ DELTA -> ARROW -> POLARS ----------
-tqdm.write("Lendo Delta (delta-rs) ...")
-dt = DeltaTable(DELTA_DIR)
-arrow_tbl = dt.to_pyarrow_table()
-df = pl.from_arrow(arrow_tbl)
-
-missing = NEEDED_COLS - set(df.columns)
-if missing:
-    sys.exit(f"Colunas ausentes na Delta: {sorted(missing)}")
-
-# ---------- TYPE CAST ts ----------
-tqdm.write("Convertendo 'ts' para datetime e removendo nulos...")
-ts_dtype = df.schema["ts"]
-if ts_dtype == pl.Utf8:
-    # Preferência: str.strptime; fallback para str.to_datetime
+def parse_datetime_multi(df: pl.DataFrame, col: str) -> pl.DataFrame:
+    if col not in df.columns:
+        return df
+    if df.schema[col] == pl.Datetime:
+        return df
+    fmts = [
+        "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S",
+        "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S",
+        "%d-%m-%Y %H:%M", "%d-%m-%Y %H:%M:%S",
+    ]
+    for fmt in fmts:
+        try:
+            return df.with_columns(pl.col(col).str.strptime(pl.Datetime, fmt=fmt, strict=True).alias(col))
+        except Exception:
+            continue
+    # fallback via pandas (dayfirst=True)
     try:
-        df = df.with_columns(pl.col("ts").str.strptime(pl.Datetime, strict=False).alias("ts"))
+        s = df.select(pl.col(col)).to_series().to_list()
+        s_pd = pd.to_datetime(pd.Series(s), dayfirst=True, errors="coerce")
+        return df.with_columns(pl.Series(name=col, values=s_pd).cast(pl.Datetime))
     except Exception:
-        df = df.with_columns(pl.col("ts").str.to_datetime(strict=False).alias("ts"))
-elif ts_dtype != pl.Datetime:
-    df = df.with_columns(pl.col("ts").cast(pl.Datetime).alias("ts"))
+        return ensure_datetime_infer(df, col)
 
-df = df.drop_nulls(subset=["ts"])
+def minute_calendar(t0: dt.datetime, t1: dt.datetime) -> pl.DataFrame:
+    idx = pd.date_range(t0, t1, freq="1min", inclusive="left")
+    # Em ns para casar com joins
+    return pl.DataFrame({"ts": pl.Series(idx).cast(pl.Datetime(time_unit="ns"))})
 
-# ---------- DATA_RELATIVA (vetorizado) ----------
-tqdm.write("Gerando DATA_RELATIVA (Polars vetorizado)...")
-df = df.with_columns([
-    (1 + ((pl.col("ts").dt.ordinal_day() - 1) // 7)).alias("SEMANA_ANO_INICIO_01JAN"),
-    pl.col("ts").dt.weekday().alias("WDN"),          # 0..6 (seg..dom)
-    pl.col("ts").dt.strftime("%H%M").alias("HHMM"),
+def as_py_dt(x) -> dt.datetime:
+    if isinstance(x, dt.datetime):
+        return x
+    try:
+        return pd.to_datetime(x).to_pydatetime()
+    except Exception:
+        return pd.to_datetime(str(x)).to_pydatetime()
+
+def to_ns(df: pl.DataFrame, *cols: str) -> pl.DataFrame:
+    exprs = []
+    for c in cols:
+        if c in df.columns:
+            exprs.append(pl.col(c).cast(pl.Datetime(time_unit="ns")).alias(c))
+    return df.with_columns(exprs) if exprs else df
+
+def interval_project_asof(calendar: pl.DataFrame, base: pl.DataFrame, keep_cols: list[str]) -> pl.DataFrame:
+    """
+    Associa cada ts ao último intervalo com INI<=ts (join_asof backward),
+    mantém apenas ts<FIM, e agrega por ts com max().
+    """
+    cal  = to_ns(calendar, "ts").sort("ts")
+    base = to_ns(base, "a", "b").sort("a")
+    joined = cal.join_asof(base, left_on="ts", right_on="a", strategy="backward")
+    valid  = joined.filter(pl.col("b").is_not_null() & (pl.col("ts") < pl.col("b")))
+    if valid.is_empty():
+        zeros = [pl.lit(0, dtype=pl.Int32).alias(c) for c in keep_cols]
+        return cal.select(["ts"] + zeros)
+    agg = (valid.group_by("ts")
+           .agg([*(pl.max(c).cast(pl.Int32).alias(c) for c in keep_cols)])
+           .sort("ts"))
+    out = (cal.join(agg, on="ts", how="left")
+              .with_columns([pl.col(c).fill_null(0).cast(pl.Int32) for c in keep_cols]))
+    return out.select(["ts"] + keep_cols)
+
+# -------- SIATFM --------
+if not os.path.isfile(ARQ_SIATFM):
+    sys.exit(f"Arquivo SIATFM não encontrado: {ARQ_SIATFM}")
+
+tqdm.write("Lendo SIATFM (Excel)...")
+df_s_pd = pd.read_excel(ARQ_SIATFM, engine="openpyxl")
+df_s = pl.from_pandas(df_s_pd)
+
+cols_s = normalize_cols(df_s)
+for k in ["inicio", "fim", "qt_consoles"]:
+    if k not in cols_s:
+        sys.exit(f"Coluna obrigatória ausente no SIATFM: {k.upper()}")
+
+s_ini  = cols_s["inicio"]
+s_fim  = cols_s["fim"]
+s_qt   = cols_s["qt_consoles"]
+s_agrp = cols_s.get("agrupamentos") or cols_s.get("agrup")
+
+df_s = parse_datetime_multi(df_s, s_ini)
+df_s = parse_datetime_multi(df_s, s_fim)
+
+df_s = df_s.with_columns([
+    pl.col(s_ini).alias("INI"),
+    pl.col(s_fim).alias("FIM"),
+    pl.col(s_qt).cast(pl.Int32).fill_null(0).alias("QT_CONSOLES_SIS"),
 ])
+if s_agrp:
+    df_s = df_s.with_columns(pl.col(s_agrp).cast(pl.Utf8).alias("AGRUPAMENTOS"))
 
-df = df.with_columns(
-    pl.when(pl.col("WDN") == 0).then(pl.lit(WEEKDAY_ABBR[0]))
-     .when(pl.col("WDN") == 1).then(pl.lit(WEEKDAY_ABBR[1]))
-     .when(pl.col("WDN") == 2).then(pl.lit(WEEKDAY_ABBR[2]))
-     .when(pl.col("WDN") == 3).then(pl.lit(WEEKDAY_ABBR[3]))
-     .when(pl.col("WDN") == 4).then(pl.lit(WEEKDAY_ABBR[4]))
-     .when(pl.col("WDN") == 5).then(pl.lit(WEEKDAY_ABBR[5]))
-     .otherwise(pl.lit(WEEKDAY_ABBR[6]))
-     .alias("DDD")
+df_s = df_s.select([c for c in ["INI","FIM","QT_CONSOLES_SIS","AGRUPAMENTOS"] if c in df_s.columns])
+df_s = df_s.filter(pl.col("INI") < pl.col("FIM"))
+if df_s.is_empty():
+    sys.exit("SIATFM sem linhas válidas (INI < FIM).")
+
+# -------- PUPSI (CSV ; com aspas) --------
+if not os.path.isfile(ARQ_PUPSI):
+    sys.exit(f"Arquivo PUPSI não encontrado: {ARQ_PUPSI}")
+
+tqdm.write("Lendo PUPSI (CSV)...")
+def read_pupsi_csv(path: str) -> pl.DataFrame:
+    last_err = None
+    for enc in ("utf8", "latin1"):
+        try:
+            return pl.read_csv(
+                path,
+                separator=";",
+                quote_char='"',
+                infer_schema_length=10000,
+                null_values=["\\N", ""],
+                encoding=enc,
+                ignore_errors=False,
+                truncate_ragged_lines=True,
+            )
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+df_p = read_pupsi_csv(ARQ_PUPSI)
+cols_p = normalize_cols(df_p)
+
+has_split_date = all(k in cols_p for k in ["ano", "mes", "dia", "inicio", "fim"])
+has_ready_dt   = all(k in cols_p for k in ["inicio", "fim"]) and not has_split_date
+
+for k in ["qt_ctr","qt_ass","qt_coor"]:
+    if k not in cols_p:
+        sys.exit(f"Coluna obrigatória ausente no PUPSI: {k.upper()}")
+
+p_ctr = cols_p["qt_ctr"];  p_ass = cols_p["qt_ass"]; p_coo = cols_p["qt_coor"]
+
+if has_split_date:
+    c_ano = cols_p["ano"]; c_mes = cols_p["mes"]; c_dia = cols_p["dia"]
+    c_ini = cols_p["inicio"]; c_fim = cols_p["fim"]
+
+    df_p = df_p.with_columns([
+        pl.col(c_ano).cast(pl.Int32).alias("ANO"),
+        pl.col(c_mes).cast(pl.Int32).alias("MES"),
+        pl.col(c_dia).cast(pl.Int32).alias("DIA"),
+        pl.col(c_ini).cast(pl.Utf8).alias("HINI"),
+        pl.col(c_fim).cast(pl.Utf8).alias("HFIM"),
+        pl.col(p_ctr).cast(pl.Int32).fill_null(0).alias("Q_CTR"),
+        pl.col(p_ass).cast(pl.Int32).fill_null(0).alias("Q_ASS"),
+        pl.col(p_coo).cast(pl.Int32).fill_null(0).alias("Q_COOR"),
+    ]).with_columns([
+        pl.col("HINI").str.extract(r"^(\d{1,2})", 1).cast(pl.Int32).fill_null(0).alias("INI_H"),
+        pl.col("HINI").str.extract(r":(\d{1,2})", 1).cast(pl.Int32).fill_null(0).alias("INI_M"),
+        pl.col("HFIM").str.extract(r"^(\d{1,2})", 1).cast(pl.Int32).fill_null(0).alias("FIM_H"),
+        pl.col("HFIM").str.extract(r":(\d{1,2})", 1).cast(pl.Int32).fill_null(0).alias("FIM_M"),
+    ]).with_columns([
+        pl.when((pl.col("INI_H")>=0) & (pl.col("INI_H")<=23)).then(pl.col("INI_H")).otherwise(0).alias("INI_H"),
+        pl.when((pl.col("INI_M")>=0) & (pl.col("INI_M")<=59)).then(pl.col("INI_M")).otherwise(0).alias("INI_M"),
+        pl.when((pl.col("FIM_H")>=0) & (pl.col("FIM_H")<=23)).then(pl.col("FIM_H")).otherwise(0).alias("FIM_H"),
+        pl.when((pl.col("FIM_M")>=0) & (pl.col("FIM_M")<=59)).then(pl.col("FIM_M")).otherwise(0).alias("FIM_M"),
+    ]).with_columns([
+        pl.datetime("ANO","MES","DIA","INI_H","INI_M", 0).alias("INI"),
+        pl.datetime("ANO","MES","DIA","FIM_H","FIM_M", 0).alias("FIM"),
+    ]).select(["INI","FIM","Q_CTR","Q_ASS","Q_COOR"])
+
+elif has_ready_dt:
+    p_ini = cols_p["inicio"]; p_fim = cols_p["fim"]
+    df_p = parse_datetime_multi(df_p, p_ini)
+    df_p = parse_datetime_multi(df_p, p_fim)
+    df_p = (df_p
+            .with_columns([
+                pl.col(p_ini).alias("INI"),
+                pl.col(p_fim).alias("FIM"),
+                pl.col(p_ctr).cast(pl.Int32).fill_null(0).alias("Q_CTR"),
+                pl.col(p_ass).cast(pl.Int32).fill_null(0).alias("Q_ASS"),
+                pl.col(p_coo).cast(pl.Int32).fill_null(0).alias("Q_COOR"),
+            ])
+            .select(["INI","FIM","Q_CTR","Q_ASS","Q_COOR"])
+           )
+else:
+    sys.exit("PUPSI não tem colunas esperadas (INICIO/FIM ou ANO/MES/DIA + INICIO/FIM).")
+
+df_p = df_p.filter(pl.col("INI") < pl.col("FIM"))
+if df_p.is_empty():
+    sys.exit("PUPSI sem linhas válidas (INI < FIM).")
+
+# -------- Calendário minuto-a-minuto --------
+t0 = as_py_dt(min(df_s["INI"].min(), df_p["INI"].min()))
+t1 = as_py_dt(max(df_s["FIM"].max(), df_p["FIM"].max()))
+cal = minute_calendar(t0, t1)
+
+# -------- Interseções minuto (ASOF) --------
+tqdm.write("Projetando SIATFM (join_asof)...")
+si_base = df_s.select([pl.col("INI").alias("a"), pl.col("FIM").alias("b"), pl.col("QT_CONSOLES_SIS")])
+mins_s  = interval_project_asof(cal, si_base, ["QT_CONSOLES_SIS"])
+
+tqdm.write("Projetando PUPSI (join_asof)...")
+pu_base = df_p.select([pl.col("INI").alias("a"), pl.col("FIM").alias("b"),
+                       pl.col("Q_CTR"), pl.col("Q_ASS"), pl.col("Q_COOR")])
+mins_p  = interval_project_asof(cal, pu_base, ["Q_CTR","Q_ASS","Q_COOR"])
+
+# -------- Base MINUTO --------
+minute_df = (cal
+    .join(mins_s, on="ts", how="left")  # só para referência/comparação (não usado no QT_CONSOLES final)
+    .join(mins_p, on="ts", how="left")
+    .with_columns([
+        pl.col("QT_CONSOLES_SIS").fill_null(0).cast(pl.Int32),
+        pl.col("Q_CTR").fill_null(0).cast(pl.Int32),
+        pl.col("Q_ASS").fill_null(0).cast(pl.Int32),
+        pl.col("Q_COOR").fill_null(0).cast(pl.Int32),
+    ])
 )
 
-df = df.with_columns(
-    (pl.col("SEMANA_ANO_INICIO_01JAN").cast(pl.Utf8) + pl.col("DDD") + pl.col("HHMM")).alias("DATA_RELATIVA")
+# -------- Q_SPVS / TURNO --------
+minute_df = minute_df.with_columns(
+    (pl.col("ts").dt.hour()*60 + pl.col("ts").dt.minute()).alias("min_dia")
+).with_columns([
+    pl.when((pl.col("min_dia")>=345) & (pl.col("min_dia")<825)).then(pl.lit(2))
+     .when((pl.col("min_dia")>=825) & (pl.col("min_dia")<1275)).then(pl.lit(2))
+     .otherwise(pl.lit(1)).alias("Q_SPVS"),
+    pl.when((pl.col("min_dia")>=345) & (pl.col("min_dia")<825)).then(pl.lit("M"))
+     .when((pl.col("min_dia")>=825) & (pl.col("min_dia")<1275)).then(pl.lit("T"))
+     .otherwise(pl.lit("P")).alias("TURNO"),
+]).drop("min_dia")
+
+# -------- Derivadas pedidas --------
+minute_df = minute_df.with_columns([
+    # QT_CONSOLES final = Q_CTR + Q_COOR + Q_SPVS
+    (pl.col("Q_CTR") + pl.col("Q_COOR") + pl.col("Q_SPVS")).alias("QT_CONSOLES"),
+    # Q_POS = Q_CTR + Q_ASS + Q_COOR + Q_SPVS
+    (pl.col("Q_CTR") + pl.col("Q_ASS") + pl.col("Q_COOR") + pl.col("Q_SPVS")).alias("Q_POS"),
+]).select(["ts","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","TURNO","QT_CONSOLES","Q_POS","QT_CONSOLES_SIS"])
+
+# -------- Salva MINUTO --------
+os.makedirs(os.path.dirname(OUT_MINUTE), exist_ok=True)
+minute_df.write_parquet(OUT_MINUTE, compression="zstd", statistics=True)
+tqdm.write(f"[OK] MINUTO salvo: {OUT_MINUTE}")
+
+# -------- Agrega STRICT 30m --------
+tqdm.write("Agregando STRICT para 30min...")
+df30 = (minute_df
+    .group_by_dynamic(index_column="ts", every="30m", period="30m", label="left", closed="left")
+    .agg([
+        # agregamos os componentes por 30 min (max)
+        pl.max("Q_CTR").alias("Q_CTR"),
+        pl.max("Q_ASS").alias("Q_ASS"),
+        pl.max("Q_COOR").alias("Q_COOR"),
+        pl.max("Q_SPVS").alias("Q_SPVS"),
+        pl.first("TURNO").alias("TURNO"),
+        # (opcional) manter uma referência do SIATFM por janela
+        pl.max("QT_CONSOLES_SIS").alias("QT_CONSOLES_SIS_MAX"),
+    ])
+    # recomputa as derivadas a partir dos agregados
+    .with_columns([
+        (pl.col("Q_CTR") + pl.col("Q_COOR") + pl.col("Q_SPVS")).alias("QT_CONSOLES"),
+        (pl.col("Q_CTR") + pl.col("Q_ASS") + pl.col("Q_COOR") + pl.col("Q_SPVS")).alias("Q_POS"),
+    ])
+    .select(["ts","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","TURNO","QT_CONSOLES","Q_POS","QT_CONSOLES_SIS_MAX"])
+    .sort("ts")
 )
 
-# ---------- ORDER & SELECT ----------
-tqdm.write("Ordenando por 'ts'...")
-df = df.sort("ts")
+os.makedirs(os.path.dirname(OUT_30MIN), exist_ok=True)
+df30.write_parquet(OUT_30MIN, compression="zstd", statistics=True)
+tqdm.write(f"[OK] 30min STRICT salvo: {OUT_30MIN}")
 
-df_out = df.select(["ts", "DATA_RELATIVA", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "TURNO"])
-
-# ---------- WRITE PARQUET ----------
-tqdm.write("Gravando Parquet (compressão ZSTD)...")
-os.makedirs(os.path.dirname(OUT_PARQUET), exist_ok=True)
-df_out.write_parquet(OUT_PARQUET, compression="zstd", statistics=True)
-
-tqdm.write(f"OK! Parquet salvo em: {OUT_PARQUET}")
-tqdm.write("Amostra das primeiras linhas:")
-tqdm.write(df_out.head(8).to_pandas().to_string(index=False))
+# -------- Amostra --------
+tqdm.write("Amostra MINUTO:")
+tqdm.write(minute_df.head(10).to_pandas().to_string(index=False))
+tqdm.write("Amostra 30min STRICT:")
+tqdm.write(df30.head(10).to_pandas().to_string(index=False))
