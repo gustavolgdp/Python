@@ -1,0 +1,163 @@
+# -*- coding: utf-8 -*-
+r"""
+RADAR_FAIXAS_MAXIMO
+-------------------
+Lê C:\Output\parquet\fato_setorizacao_min.parquet (base minuto-a-minuto)
+e calcula, para cada faixa horária (independente do dia), o MÁXIMO observado
+de Q_CTR, Q_ASS, Q_COOR, QT_CONSOLES e Q_POS.
+
+Saídas:
+  - C:\Output\relatorios\radar_faixas_maximos.csv
+  - C:\Output\relatorios\radar_faixas_maximos.xlsx
+"""
+
+import os
+import sys
+from typing import Tuple, List
+from tqdm import tqdm
+
+# ---------- CONFIG ----------
+IN_PARQUET = r"C:\Output\parquet\fato_setorizacao_min.parquet"
+OUT_DIR    = r"C:\Output\relatorios"
+OUT_CSV    = os.path.join(OUT_DIR, "radar_faixas_maximos.csv")
+OUT_XLSX   = os.path.join(OUT_DIR, "radar_faixas_maximos.xlsx")
+
+# Faixas pedidas (início, fim) no formato HH:MM (fim é exclusivo)
+FAIXAS = [
+    ("05:30", "06:45"),
+    ("06:45", "07:45"),
+    ("07:45", "08:45"),
+    ("08:45", "09:45"),
+    ("09:45", "10:45"),
+    ("10:45", "11:45"),
+    ("11:45", "12:45"),
+    ("12:45", "13:45"),
+    ("13:30", "14:30"),
+    ("14:30", "15:30"),
+    ("15:30", "16:30"),
+    ("16:30", "17:30"),
+    ("17:30", "18:30"),
+    ("18:30", "19:30"),
+    ("19:30", "20:30"),
+    ("20:30", "21:15"),
+    ("21:15", "22:15"),
+    ("22:15", "23:15"),
+    ("23:15", "00:15"),
+    ("00:15", "01:15"),
+    ("01:15", "02:15"),
+    ("02:15", "03:15"),
+    ("03:15", "04:15"),
+    ("04:15", "05:45"),
+]
+
+# ---------- IMPORTS ----------
+try:
+    import polars as pl
+except Exception as e:
+    sys.exit(f"Erro ao importar polars: {e}\nInstale com: pip install polars")
+try:
+    import pandas as pd
+except Exception as e:
+    sys.exit(f"Erro ao importar pandas: {e}\nInstale com: pip install pandas")
+
+
+# ---------- FUNÇÕES ----------
+def hhmm_to_min(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+def faixa_label(a_min: int, b_min: int) -> str:
+    """Formata label 'HH:MM–HH:MM' a partir de minutos (mod 24h)."""
+    def m2s(x: int) -> str:
+        x %= 1440
+        return f"{x//60:02d}:{x%60:02d}"
+    return f"{m2s(a_min)}–{m2s(b_min)}"
+
+def filtro_intervalo_min(col_min: pl.Expr, a: int, b: int) -> pl.Expr:
+    """
+    Expressão Polars que retorna True se min_dia ∈ [a,b) (com wrap em 24h).
+    """
+    if a < b:
+        # Janela normal (não cruza meia-noite)
+        return (col_min >= a) & (col_min < b)
+    else:
+        # Janela cruzando 24h: [a, 1440) ∪ [0, b)
+        return (col_min >= a) | (col_min < b)
+
+
+# ---------- CARGA ----------
+if not os.path.isfile(IN_PARQUET):
+    sys.exit(f"Parquet não encontrado: {IN_PARQUET}")
+
+print("Lendo Parquet…")
+df = pl.read_parquet(IN_PARQUET)
+
+# Checagem de colunas necessárias
+NEEDED = {"ts", "Q_CTR", "Q_ASS", "Q_COOR", "Q_SPVS", "QT_CONSOLES", "Q_POS"}
+missing = NEEDED - set(df.columns)
+if missing:
+    sys.exit(f"Colunas ausentes no parquet: {sorted(missing)}")
+
+# Normaliza tipos e cria coluna 'min_dia'
+if df.schema["ts"] != pl.Datetime:
+    df = df.with_columns(pl.col("ts").cast(pl.Datetime))
+
+df = (df
+      .drop_nulls(subset=["ts"])
+      .with_columns([
+          (pl.col("ts").dt.hour() * 60 + pl.col("ts").dt.minute()).cast(pl.Int32).alias("min_dia"),
+          pl.col("Q_CTR").fill_null(0).cast(pl.Int32),
+          pl.col("Q_ASS").fill_null(0).cast(pl.Int32),
+          pl.col("Q_COOR").fill_null(0).cast(pl.Int32),
+          pl.col("Q_SPVS").fill_null(0).cast(pl.Int32),
+          pl.col("QT_CONSOLES").fill_null(0).cast(pl.Int32),
+          pl.col("Q_POS").fill_null(0).cast(pl.Int32),
+      ]))
+
+# ---------- CÁLCULO ----------
+rows: List[Tuple[str, int, int, int, int, int]] = []
+print("Gerando máximos por faixa:")
+for (ini_s, fim_s) in tqdm(FAIXAS, unit="faixa"):
+    a = hhmm_to_min(ini_s)
+    b = hhmm_to_min(fim_s)
+
+    mask = filtro_intervalo_min(pl.col("min_dia"), a, b)
+    sub = df.filter(mask)
+
+    # Se por acaso a faixa não tiver linhas, resultados 0
+    if sub.is_empty():
+        rows.append((
+            faixa_label(a, b), 0, 0, 0, 0, 0
+        ))
+        continue
+
+    mx = sub.select([
+        pl.max("Q_CTR").alias("Q_CTR_MAX"),
+        pl.max("Q_ASS").alias("Q_ASS_MAX"),
+        pl.max("Q_COOR").alias("Q_COOR_MAX"),
+        pl.max("QT_CONSOLES").alias("QT_CONSOLES_MAX"),
+        pl.max("Q_POS").alias("Q_POS_MAX"),
+    ]).row(0)
+
+    rows.append((faixa_label(a, b), *mx))
+
+# ---------- SAÍDA ----------
+out = pl.DataFrame(
+    rows,
+    schema=["Faixa", "Q_CTR_MAX", "Q_ASS_MAX", "Q_COOR_MAX", "QT_CONSOLES_MAX", "Q_POS_MAX"]
+)
+
+print("\nMáximos por faixa (independente do dia):")
+print(out.to_pandas().to_string(index=False))
+
+os.makedirs(OUT_DIR, exist_ok=True)
+out.write_csv(OUT_CSV)
+try:
+    out.write_excel(OUT_XLSX, sheet_name="faixas_max", autofit=True)
+except Exception:
+    # fallback simples
+    out.to_pandas().to_excel(OUT_XLSX, sheet_name="faixas_max", index=False)
+
+print("\nArquivos salvos:")
+print(f"- CSV : {OUT_CSV}")
+print(f"- XLSX: {OUT_XLSX}")
