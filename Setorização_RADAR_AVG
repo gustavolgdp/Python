@@ -1,0 +1,169 @@
+# -*- coding: utf-8 -*-
+r"""
+RADAR_FAIXAS_MEDIA
+------------------
+Calcula a MÉDIA por faixa de relógio (independente do dia) sobre a base minuto:
+  C:\Output\parquet\fato_setorizacao_min.parquet
+
+- Para cada faixa (ex.: 05:30–06:45), pega todos os minutos do ano que caem nessa janela
+  (em qualquer dia) e calcula a média de Q_CTR, Q_ASS, Q_COOR, QT_CONSOLES e Q_POS.
+- Trata corretamente faixas que cruzam a meia-noite (ex.: 23:15–00:15).
+- Opcional: filtrar apenas minutos com console no SIATFM (QT_CONSOLES_SIS > 0).
+
+Saídas:
+  - C:\Output\relatorios\radar_faixas_media.csv
+  - C:\Output\relatorios\radar_faixas_media.xlsx
+"""
+
+import os, sys
+from typing import Tuple, List
+
+# ------------ CONFIG ------------
+IN_PARQUET = r"C:\Output\parquet\fato_setorizacao_min.parquet"
+OUT_DIR    = r"C:\Output\relatorios"
+OUT_CSV    = os.path.join(OUT_DIR, "radar_faixas_media.csv")
+OUT_XLSX   = os.path.join(OUT_DIR, "radar_faixas_media.xlsx")
+
+# Se True, considera apenas minutos onde QT_CONSOLES_SIS > 0
+USAR_SIATFM = False
+
+# Faixas (fim exclusivo)
+FAIXAS = [
+    ("05:30", "06:45"),
+    ("06:45", "07:45"),
+    ("07:45", "08:45"),
+    ("08:45", "09:45"),
+    ("09:45", "10:45"),
+    ("10:45", "11:45"),
+    ("11:45", "12:45"),
+    ("12:45", "13:45"),
+    ("13:30", "14:30"),
+    ("14:30", "15:30"),
+    ("15:30", "16:30"),
+    ("16:30", "17:30"),
+    ("17:30", "18:30"),
+    ("18:30", "19:30"),
+    ("19:30", "20:30"),
+    ("20:30", "21:15"),
+    ("21:15", "22:15"),
+    ("22:15", "23:15"),
+    ("23:15", "00:15"),
+    ("00:15", "01:15"),
+    ("01:15", "02:15"),
+    ("02:15", "03:15"),
+    ("03:15", "04:15"),
+    ("04:15", "05:45"),
+]
+
+# ------------ IMPORTS ------------
+try:
+    import polars as pl
+except Exception as e:
+    sys.exit(f"Erro ao importar polars: {e}\nInstale com: pip install polars")
+try:
+    import pandas as pd  # apenas para fallback em Excel
+except Exception as e:
+    sys.exit(f"Erro ao importar pandas: {e}\nInstale com: pip install pandas")
+
+
+def parse_hhmm(hhmm: str) -> Tuple[int,int]:
+    h, m = hhmm.split(":")
+    return int(h), int(m)
+
+def label_faixa(a: Tuple[int,int], b: Tuple[int,int]) -> str:
+    return f"{a[0]:02d}:{a[1]:02d}–{b[0]:02d}:{b[1]:02d}"
+
+def filtro_faixa_expr(H: pl.Expr, M: pl.Expr, a: Tuple[int,int], b: Tuple[int,int]) -> pl.Expr:
+    """Retorna expressão booleana para (H,M) ∈ [a,b), com wrap quando cruza a meia-noite."""
+    Ha, Ma = a; Hb, Mb = b
+    ge_a = (H > Ha) | ((H == Ha) & (M >= Ma))
+    lt_b = (H < Hb) | ((H == Hb) & (M < Mb))
+    if (Ha, Ma) < (Hb, Mb):
+        return ge_a & lt_b
+    else:
+        return ge_a | lt_b
+
+
+# ------------ CARGA ------------
+if not os.path.isfile(IN_PARQUET):
+    sys.exit(f"Parquet não encontrado: {IN_PARQUET}")
+
+print("Lendo Parquet…")
+df = pl.read_parquet(IN_PARQUET)
+
+NEEDED = {"ts","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","QT_CONSOLES","Q_POS"}
+missing = NEEDED - set(df.columns)
+if missing:
+    sys.exit(f"Colunas ausentes no parquet: {sorted(missing)}")
+
+if df.schema["ts"] != pl.Datetime:
+    df = df.with_columns(pl.col("ts").cast(pl.Datetime))
+
+df = (df.drop_nulls(subset=["ts"])
+        .with_columns([
+            pl.col("Q_CTR").fill_null(0).cast(pl.Float64),
+            pl.col("Q_ASS").fill_null(0).cast(pl.Float64),
+            pl.col("Q_COOR").fill_null(0).cast(pl.Float64),
+            pl.col("QT_CONSOLES").fill_null(0).cast(pl.Float64),
+            pl.col("Q_POS").fill_null(0).cast(pl.Float64),
+            pl.col("ts").dt.hour().alias("H"),
+            pl.col("ts").dt.minute().alias("M"),
+        ]))
+
+if USAR_SIATFM:
+    if "QT_CONSOLES_SIS" not in df.columns:
+        sys.exit("USAR_SIATFM=True mas 'QT_CONSOLES_SIS' não está no parquet.")
+    df = df.filter(pl.col("QT_CONSOLES_SIS") > 0)
+
+# ------------ CÁLCULO (MÉDIAS) ------------
+rows: List[Tuple[str, float, float, float, float, float]] = []
+for ini_s, fim_s in FAIXAS:
+    a = parse_hhmm(ini_s); b = parse_hhmm(fim_s)
+    mask = filtro_faixa_expr(pl.col("H"), pl.col("M"), a, b)
+    sub  = df.filter(mask)
+
+    if sub.is_empty():
+        rows.append((label_faixa(a,b), 0.0, 0.0, 0.0, 0.0, 0.0))
+        continue
+
+    stats = sub.select([
+        pl.mean("Q_CTR").alias("Q_CTR_MEDIA"),
+        pl.mean("Q_ASS").alias("Q_ASS_MEDIA"),
+        pl.mean("Q_COOR").alias("Q_COOR_MEDIA"),
+        pl.mean("QT_CONSOLES").alias("QT_CONSOLES_MEDIA"),
+        pl.mean("Q_POS").alias("Q_POS_MEDIA"),
+    ]).row(0)
+
+    rows.append((label_faixa(a,b), *stats))
+
+out = pl.DataFrame(
+    rows,
+    schema=["Faixa","Q_CTR_MEDIA","Q_ASS_MEDIA","Q_COOR_MEDIA","QT_CONSOLES_MEDIA","Q_POS_MEDIA"]
+)
+
+# ---------- ARREDONDAMENTO ----------
+def arredonda_int(col: str) -> pl.Expr:
+    return pl.col(col).round(0).cast(pl.Int32)
+
+out = out.with_columns([
+    arredonda_int("Q_CTR_MEDIA").alias("Q_CTR_MEDIA"),
+    arredonda_int("Q_ASS_MEDIA").alias("Q_ASS_MEDIA"),
+    arredonda_int("Q_COOR_MEDIA").alias("Q_COOR_MEDIA"),
+    arredonda_int("QT_CONSOLES_MEDIA").alias("QT_CONSOLES_MEDIA"),
+    arredonda_int("Q_POS_MEDIA").alias("Q_POS_MEDIA"),
+])
+
+print("\nMédias por faixa (independente do dia, arredondadas):")
+print(out.to_pandas().to_string(index=False))
+
+# ------------ SAÍDAS ------------
+os.makedirs(OUT_DIR, exist_ok=True)
+out.write_csv(OUT_CSV)
+try:
+    out.write_excel(OUT_XLSX, sheet_name="faixas_media", autofit=True)
+except Exception:
+    out.to_pandas().to_excel(OUT_XLSX, sheet_name="faixas_media", index=False)
+
+print("\nArquivos salvos:")
+print(f"- CSV : {OUT_CSV}")
+print(f"- XLSX: {OUT_XLSX}")
