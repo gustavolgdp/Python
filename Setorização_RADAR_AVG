@@ -1,0 +1,207 @@
+# -*- coding: utf-8 -*-
+r"""
+RADAR_FAIXAS_MEDIA_DIAS_QCTR_sem0e14_v1
+---------------------------------------
+- Calcula a MÉDIA por faixa de relógio em dois níveis:
+  (1) média DIÁRIA dentro da faixa; (2) média ENTRE os dias.
+- Para Q_CTR: ignora {0,14} nas duas etapas; se nenhum dia válido -> fallback=1.
+- Q_ASS, Q_COOR, QT_CONSOLES, Q_POS: sem exclusões.
+- Arredondamento final: 0–4 para BAIXO; 5–9 para CIMA (regra clássica).
+
+Entrada:
+  C:\Output\parquet\fato_setorizacao_min.parquet
+
+Saídas:
+  C:\Output\relatorios\radar_faixas_media_dias_QCTR_sem0e14.csv
+  C:\Output\relatorios\radar_faixas_media_dias_QCTR_sem0e14.xlsx
+"""
+
+import os, sys
+from typing import Tuple, List
+
+# -------- Config --------
+IN_PARQUET = r"C:\Output\parquet\fato_setorizacao_min.parquet"
+OUT_DIR    = r"C:\Output\relatorios"
+OUT_CSV    = os.path.join(OUT_DIR, "radar_faixas_media_dias_QCTR_sem0e14.csv")
+OUT_XLSX   = os.path.join(OUT_DIR, "radar_faixas_media_dias_QCTR_sem0e14.xlsx")
+
+FAIXAS = [
+    ("05:30", "06:45"), ("06:45", "07:45"), ("07:45", "08:45"), ("08:45", "09:45"),
+    ("09:45", "10:45"), ("10:45", "11:45"), ("11:45", "12:45"), ("12:45", "13:45"),
+    ("13:30", "14:30"), ("14:30", "15:30"), ("15:30", "16:30"), ("16:30", "17:30"),
+    ("17:30", "18:30"), ("18:30", "19:30"), ("19:30", "20:30"), ("20:30", "21:15"),
+    ("21:15", "22:15"), ("22:15", "23:15"), ("23:15", "00:15"), ("00:15", "01:15"),
+    ("01:15", "02:15"), ("02:15", "03:15"), ("03:15", "04:15"), ("04:15", "05:45"),
+]
+
+SHOW_SAMPLE = 25  # linhas da prévia
+
+# -------- Imports --------
+try:
+    import polars as pl
+except Exception as e:
+    sys.exit(f"Importe polars: {e}\nInstale: pip install polars")
+try:
+    import pandas as pd
+except Exception as e:
+    sys.exit(f"Importe pandas: {e}\nInstale: pip install pandas")
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    from tqdm import tqdm
+
+DISABLE_TQDM = (not sys.stdout.isatty())
+def p(msg: str): print(msg, flush=True)
+
+# -------- Helpers --------
+def parse_hhmm(hhmm: str) -> Tuple[int,int]:
+    h, m = hhmm.split(":"); return int(h), int(m)
+
+def label_faixa(a: Tuple[int,int], b: Tuple[int,int]) -> str:
+    return f"{a[0]:02d}:{a[1]:02d}-{b[0]:02d}:{b[1]:02d}"
+
+def filtro_faixa_expr(H: pl.Expr, M: pl.Expr, a: Tuple[int,int], b: Tuple[int,int]) -> pl.Expr:
+    """(H,M) ∈ [a,b), com wrap de meia-noite."""
+    Ha, Ma = a; Hb, Mb = b
+    ge_a = (H > Ha) | ((H == Ha) & (M >= Ma))
+    lt_b = (H < Hb) | ((H == Hb) & (M < Mb))
+    return ge_a & lt_b if (Ha, Ma) < (Hb, Mb) else ge_a | lt_b
+
+def round_rule(x: float | None, fallback: int = 0) -> int:
+    """Arredondamento 0–4 para baixo, 5–9 para cima; None -> fallback."""
+    if x is None or (isinstance(x, float) and (x != x)):  # NaN
+        return fallback
+    # regra clássica: +0.5 e floor
+    import math
+    return int(math.floor(float(x) + 0.5))
+
+def mean_diaria(col: str, sub: pl.DataFrame, excluir: set[int] | None = None) -> pl.DataFrame:
+    """
+    Média DIÁRIA de 'col' por DIA dentro da faixa.
+    - Se 'excluir' for fornecido, ignora esses valores (tratando-os como NULL).
+    - Retorna: DataFrame [DIA, <col>_d] com a média diária (pode ser NULL).
+    """
+    if excluir:
+        expr_val = pl.when(~pl.col(col).is_in(list(excluir))).then(pl.col(col)).otherwise(None)
+    else:
+        expr_val = pl.col(col)
+
+    return (sub
+            .group_by("DIA")
+            .agg(pl.mean(expr_val).alias(f"{col}_d"))
+            .select(["DIA", f"{col}_d"])
+           )
+
+def mean_entre_dias(diarias: pl.DataFrame, col_d: str, fallback_if_empty: int = 0) -> tuple[float | None, int]:
+    """
+    Média ENTRE os dias do campo '<col>_d'. Retorna (media, dias_validos).
+    - Ignora NULLs (dias em que a média diária não existiu).
+    - Se não houver dias válidos -> (None, 0).
+    """
+    base = diarias.drop_nulls(subset=[col_d])
+    if base.is_empty():
+        return (None, 0)
+    return (float(base.select(pl.mean(col_d)).item()), int(base.height))
+
+def full_join_safe(left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
+    out = left.join(right, on="DIA", how="full", coalesce=True)
+    if "DIA_right" in out.columns:
+        out = out.with_columns(pl.coalesce(["DIA", "DIA_right"]).alias("DIA")).drop("DIA_right")
+    return out
+
+# -------- Carga --------
+if not os.path.isfile(IN_PARQUET):
+    sys.exit(f"Parquet não encontrado: {IN_PARQUET}")
+p("Lendo Parquet…")
+df = pl.read_parquet(IN_PARQUET)
+
+NEEDED = {"ts","Q_CTR","Q_ASS","Q_COOR","QT_CONSOLES","Q_POS"}
+missing = NEEDED - set(df.columns)
+if missing:
+    sys.exit(f"Colunas ausentes: {sorted(missing)}")
+
+if df.schema["ts"] != pl.Datetime:
+    df = df.with_columns(pl.col("ts").cast(pl.Datetime))
+
+df = (
+    df.drop_nulls(subset=["ts"])
+      .with_columns([
+          pl.col("Q_CTR").fill_null(0).cast(pl.Int32),
+          pl.col("Q_ASS").fill_null(0).cast(pl.Int32),
+          pl.col("Q_COOR").fill_null(0).cast(pl.Int32),
+          pl.col("QT_CONSOLES").fill_null(0).cast(pl.Int32),
+          pl.col("Q_POS").fill_null(0).cast(pl.Int32),
+          pl.col("ts").dt.date().alias("DIA"),
+          pl.col("ts").dt.hour().alias("H"),
+          pl.col("ts").dt.minute().alias("M"),
+      ])
+)
+
+# -------- Cálculo --------
+rows: List[tuple] = []
+p("Processando faixas para MÉDIA (pode levar alguns segundos)…")
+for ini_s, fim_s in tqdm(FAIXAS, desc="Faixas", unit="faixa",
+                         disable=DISABLE_TQDM, mininterval=0.2, leave=False):
+    a = parse_hhmm(ini_s); b = parse_hhmm(fim_s)
+    sub = df.filter(filtro_faixa_expr(pl.col("H"), pl.col("M"), a, b))
+    if sub.is_empty():
+        rows.append((label_faixa(a,b), 1, 0, 0, 0, 0, 0, 0))  # fallback Q_CTR=1
+        continue
+
+    dias_totais = sub.select("DIA").n_unique()
+
+    # médias DIÁRIAS (Q_CTR exclui {0,14})
+    d_ctr  = mean_diaria("Q_CTR", sub, excluir={0,14})
+    d_ass  = mean_diaria("Q_ASS", sub)
+    d_coor = mean_diaria("Q_COOR", sub)
+    d_qtc  = mean_diaria("QT_CONSOLES", sub)
+    d_qpos = mean_diaria("Q_POS", sub)
+
+    # junta por DIA
+    diarias = full_join_safe(d_ctr, d_ass)
+    diarias = full_join_safe(diarias, d_coor)
+    diarias = full_join_safe(diarias, d_qtc)
+    diarias = full_join_safe(diarias, d_qpos)
+
+    # médias ENTRE DIAS + arredondamento 0–4/5–9
+    m_ctr,  n_ctr  = mean_entre_dias(diarias, "Q_CTR_d")   # pode ser None
+    m_ass,  _      = mean_entre_dias(diarias, "Q_ASS_d")
+    m_coor, _      = mean_entre_dias(diarias, "Q_COOR_d")
+    m_qtc,  _      = mean_entre_dias(diarias, "QT_CONSOLES_d")
+    m_qpos, _      = mean_entre_dias(diarias, "Q_POS_d")
+
+    # arredonda
+    ctr_final  = round_rule(m_ctr,  fallback=1)  # fallback 1 se sem dias válidos
+    ass_final  = round_rule(m_ass,  fallback=0)
+    coor_final = round_rule(m_coor, fallback=0)
+    qtc_final  = round_rule(m_qtc,  fallback=0)
+    qpos_final = round_rule(m_qpos, fallback=0)
+
+    rows.append((label_faixa(a,b),
+                 ctr_final, ass_final, coor_final, qtc_final, qpos_final,
+                 int(n_ctr), int(dias_totais)))
+
+out = pl.DataFrame(
+    rows,
+    schema=[
+        "Faixa",
+        "Q_CTR_MEDIA_DIAS","Q_ASS_MEDIA_DIAS","Q_COOR_MEDIA_DIAS","QT_CONSOLES_MEDIA_DIAS","Q_POS_MEDIA_DIAS",
+        "DIAS_VALIDOS_QCTR","DIAS_TOTAIS_FAIXA"
+    ]
+)
+
+p("\nMédias por faixa (Q_CTR sem {0,14}; arredondadas 0–4/5–9; fallback=1 se sem dias válidos):")
+p(out.head(SHOW_SAMPLE).to_pandas().to_string(index=False))
+
+# -------- Salvar --------
+os.makedirs(OUT_DIR, exist_ok=True)
+out.write_csv(OUT_CSV)
+try:
+    out.write_excel(OUT_XLSX, sheet_name="media_dias_QCTR_sem0e14", autofit=True)
+except PermissionError:
+    p(f"[Aviso] Feche o arquivo no Excel se estiver aberto: {OUT_XLSX}")
+    raise
+except Exception:
+    out.to_pandas().to_excel(OUT_XLSX, sheet_name="media_dias_QCTR_sem0e14", index=False)
+
+p(f"\nArquivos salvos:\n- CSV : {OUT_CSV}\n- XLSX: {OUT_XLSX}")
