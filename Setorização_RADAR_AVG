@@ -1,169 +1,218 @@
 # -*- coding: utf-8 -*-
 r"""
-RADAR_FAIXAS_MEDIA
-------------------
-Calcula a MÉDIA por faixa de relógio (independente do dia) sobre a base minuto:
+RADAR_FAIXAS_MODA_DIAS_sem0e14_QCTR_v4
+--------------------------------------
+- Calcula a MODA por faixa de relógio, em dois níveis:
+  (1) moda DIÁRIA dentro da faixa; (2) moda ENTRE os dias.
+- Para Q_CTR: exclui {0, 14} nas duas etapas; empate -> MENOR valor.
+- Fallback Q_CTR = 1 apenas se não houver NENHUM dia válido após exclusões.
+- Q_ASS, Q_COOR, QT_CONSOLES, Q_POS: sem exclusões.
+- Impressões via print (flush) + barras "amigáveis" (tqdm desabilita
+  automaticamente se console não for TTY, típico no Spyder).
+
+Entrada:
   C:\Output\parquet\fato_setorizacao_min.parquet
 
-- Para cada faixa (ex.: 05:30–06:45), pega todos os minutos do ano que caem nessa janela
-  (em qualquer dia) e calcula a média de Q_CTR, Q_ASS, Q_COOR, QT_CONSOLES e Q_POS.
-- Trata corretamente faixas que cruzam a meia-noite (ex.: 23:15–00:15).
-- Opcional: filtrar apenas minutos com console no SIATFM (QT_CONSOLES_SIS > 0).
-
 Saídas:
-  - C:\Output\relatorios\radar_faixas_media.csv
-  - C:\Output\relatorios\radar_faixas_media.xlsx
+  C:\Output\relatorios\radar_faixas_moda_dias_QCTR_sem0e14.csv
+  C:\Output\relatorios\radar_faixas_moda_dias_QCTR_sem0e14.xlsx
 """
 
 import os, sys
 from typing import Tuple, List
 
-# ------------ CONFIG ------------
+# -------- Config --------
 IN_PARQUET = r"C:\Output\parquet\fato_setorizacao_min.parquet"
 OUT_DIR    = r"C:\Output\relatorios"
-OUT_CSV    = os.path.join(OUT_DIR, "radar_faixas_media.csv")
-OUT_XLSX   = os.path.join(OUT_DIR, "radar_faixas_media.xlsx")
+OUT_CSV    = os.path.join(OUT_DIR, "radar_faixas_moda_dias_QCTR_sem0e14.csv")
+OUT_XLSX   = os.path.join(OUT_DIR, "radar_faixas_moda_dias_QCTR_sem0e14.xlsx")
 
-# Se True, considera apenas minutos onde QT_CONSOLES_SIS > 0
-USAR_SIATFM = False
-
-# Faixas (fim exclusivo)
 FAIXAS = [
-    ("05:30", "06:45"),
-    ("06:45", "07:45"),
-    ("07:45", "08:45"),
-    ("08:45", "09:45"),
-    ("09:45", "10:45"),
-    ("10:45", "11:45"),
-    ("11:45", "12:45"),
-    ("12:45", "13:45"),
-    ("13:30", "14:30"),
-    ("14:30", "15:30"),
-    ("15:30", "16:30"),
-    ("16:30", "17:30"),
-    ("17:30", "18:30"),
-    ("18:30", "19:30"),
-    ("19:30", "20:30"),
-    ("20:30", "21:15"),
-    ("21:15", "22:15"),
-    ("22:15", "23:15"),
-    ("23:15", "00:15"),
-    ("00:15", "01:15"),
-    ("01:15", "02:15"),
-    ("02:15", "03:15"),
-    ("03:15", "04:15"),
-    ("04:15", "05:45"),
+    ("05:30", "06:45"), ("06:45", "07:45"), ("07:45", "08:45"), ("08:45", "09:45"),
+    ("09:45", "10:45"), ("10:45", "11:45"), ("11:45", "12:45"), ("12:45", "13:45"),
+    ("13:30", "14:30"), ("14:30", "15:30"), ("15:30", "16:30"), ("16:30", "17:30"),
+    ("17:30", "18:30"), ("18:30", "19:30"), ("19:30", "20:30"), ("20:30", "21:15"),
+    ("21:15", "22:15"), ("22:15", "23:15"), ("23:15", "00:15"), ("00:15", "01:15"),
+    ("01:15", "02:15"), ("02:15", "03:15"), ("03:15", "04:15"), ("04:15", "05:45"),
 ]
 
-# ------------ IMPORTS ------------
+DIAG_FAIXAS = [("21:15","22:15"), ("22:15","23:15")]  # faixas p/ diagnóstico
+DIAG_TOPK   = 8                                       # imprime top-k da dist.
+SHOW_SAMPLE = 25                                      # prévia no console
+
+# -------- Imports --------
 try:
     import polars as pl
 except Exception as e:
-    sys.exit(f"Erro ao importar polars: {e}\nInstale com: pip install polars")
+    sys.exit(f"Importe polars: {e}\nInstale: pip install polars")
 try:
-    import pandas as pd  # apenas para fallback em Excel
+    import pandas as pd
 except Exception as e:
-    sys.exit(f"Erro ao importar pandas: {e}\nInstale com: pip install pandas")
+    sys.exit(f"Importe pandas: {e}\nInstale: pip install pandas")
+try:
+    # tqdm "auto" lida melhor com consoles; desabilitamos se não-tty
+    from tqdm.auto import tqdm
+except Exception:
+    from tqdm import tqdm
 
+DISABLE_TQDM = (not sys.stdout.isatty())
+def p(msg: str):  # print com flush (Spyder/Jupyter friendly)
+    print(msg, flush=True)
 
+# -------- Helpers --------
 def parse_hhmm(hhmm: str) -> Tuple[int,int]:
-    h, m = hhmm.split(":")
-    return int(h), int(m)
+    h, m = hhmm.split(":"); return int(h), int(m)
 
 def label_faixa(a: Tuple[int,int], b: Tuple[int,int]) -> str:
-    return f"{a[0]:02d}:{a[1]:02d}–{b[0]:02d}:{b[1]:02d}"
+    # hífen simples evita problemas de fonte no console
+    return f"{a[0]:02d}:{a[1]:02d}-{b[0]:02d}:{b[1]:02d}"
 
 def filtro_faixa_expr(H: pl.Expr, M: pl.Expr, a: Tuple[int,int], b: Tuple[int,int]) -> pl.Expr:
-    """Retorna expressão booleana para (H,M) ∈ [a,b), com wrap quando cruza a meia-noite."""
+    """(H,M) ∈ [a,b), tratando wrap de meia-noite."""
     Ha, Ma = a; Hb, Mb = b
     ge_a = (H > Ha) | ((H == Ha) & (M >= Ma))
     lt_b = (H < Hb) | ((H == Hb) & (M < Mb))
-    if (Ha, Ma) < (Hb, Mb):
-        return ge_a & lt_b
-    else:
-        return ge_a | lt_b
+    return ge_a & lt_b if (Ha, Ma) < (Hb, Mb) else ge_a | lt_b
 
+def moda_diaria_empate_menor_excl(df_g: pl.DataFrame, key: str, col: str,
+                                  excluir: set[int] | None = None) -> pl.DataFrame:
+    """
+    Moda por 'key' (ex.: DIA) de 'col', com exclusões e empate -> MENOR.
+    - Se após excluir valores o dia ficar sem observações, esse dia volta None.
+    """
+    data = df_g if not excluir else df_g.filter(~pl.col(col).is_in(list(excluir)))
+    if data.is_empty():
+        return df_g.select(key).unique().with_columns(pl.lit(None).cast(pl.Int32).alias(col))
+    counted = (data.group_by([key, col]).len().rename({"len": "count"})
+                    .sort([key, "count", col], descending=[False, True, False]))
+    return counted.group_by(key).first().select([key, col])
 
-# ------------ CARGA ------------
+def full_join_safe(left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
+    out = left.join(right, on="DIA", how="full", coalesce=True)
+    if "DIA_right" in out.columns:
+        out = out.with_columns(pl.coalesce(["DIA", "DIA_right"]).alias("DIA")).drop("DIA_right")
+    return out
+
+def moda_entre_dias_empate_menor(diarias: pl.DataFrame, col: str, is_qctr: bool = False) -> tuple[int,int,int]:
+    """
+    Moda entre dias (valor, freq, dias_considerados), ignorando None; empate -> MENOR.
+    - Se não houver NENHUM dia com valor e is_qctr=True, retorna (1,0,0) como fallback.
+    """
+    base = diarias.drop_nulls(subset=[col])
+    dias_considerados = base.height
+    if base.is_empty():
+        return (1, 0, 0) if is_qctr else (0, 0, 0)
+    vc = (base.group_by(col).len().rename({"len": "freq"})
+               .sort(["freq", col], descending=[True, False]))
+    val, freq = vc.row(0)
+    return int(val if not is_qctr else max(int(val), 1)), int(freq), int(dias_considerados)
+
+# -------- Carga --------
 if not os.path.isfile(IN_PARQUET):
     sys.exit(f"Parquet não encontrado: {IN_PARQUET}")
-
-print("Lendo Parquet…")
+p("Lendo Parquet…")
 df = pl.read_parquet(IN_PARQUET)
 
-NEEDED = {"ts","Q_CTR","Q_ASS","Q_COOR","Q_SPVS","QT_CONSOLES","Q_POS"}
+NEEDED = {"ts","Q_CTR","Q_ASS","Q_COOR","QT_CONSOLES","Q_POS"}
 missing = NEEDED - set(df.columns)
 if missing:
-    sys.exit(f"Colunas ausentes no parquet: {sorted(missing)}")
+    sys.exit(f"Colunas ausentes: {sorted(missing)}")
 
 if df.schema["ts"] != pl.Datetime:
     df = df.with_columns(pl.col("ts").cast(pl.Datetime))
 
-df = (df.drop_nulls(subset=["ts"])
-        .with_columns([
-            pl.col("Q_CTR").fill_null(0).cast(pl.Float64),
-            pl.col("Q_ASS").fill_null(0).cast(pl.Float64),
-            pl.col("Q_COOR").fill_null(0).cast(pl.Float64),
-            pl.col("QT_CONSOLES").fill_null(0).cast(pl.Float64),
-            pl.col("Q_POS").fill_null(0).cast(pl.Float64),
-            pl.col("ts").dt.hour().alias("H"),
-            pl.col("ts").dt.minute().alias("M"),
-        ]))
+df = (
+    df.drop_nulls(subset=["ts"])
+      .with_columns([
+          pl.col("Q_CTR").fill_null(0).cast(pl.Int32),
+          pl.col("Q_ASS").fill_null(0).cast(pl.Int32),
+          pl.col("Q_COOR").fill_null(0).cast(pl.Int32),
+          pl.col("QT_CONSOLES").fill_null(0).cast(pl.Int32),
+          pl.col("Q_POS").fill_null(0).cast(pl.Int32),
+          pl.col("ts").dt.date().alias("DIA"),
+          pl.col("ts").dt.hour().alias("H"),
+          pl.col("ts").dt.minute().alias("M"),
+      ])
+)
 
-if USAR_SIATFM:
-    if "QT_CONSOLES_SIS" not in df.columns:
-        sys.exit("USAR_SIATFM=True mas 'QT_CONSOLES_SIS' não está no parquet.")
-    df = df.filter(pl.col("QT_CONSOLES_SIS") > 0)
-
-# ------------ CÁLCULO (MÉDIAS) ------------
-rows: List[Tuple[str, float, float, float, float, float]] = []
-for ini_s, fim_s in FAIXAS:
+# -------- Cálculo --------
+rows: List[tuple] = []
+p("Processando faixas (pode levar alguns segundos)…")
+for ini_s, fim_s in tqdm(FAIXAS, desc="Faixas", unit="faixa",
+                         disable=DISABLE_TQDM, mininterval=0.2, leave=False):
     a = parse_hhmm(ini_s); b = parse_hhmm(fim_s)
-    mask = filtro_faixa_expr(pl.col("H"), pl.col("M"), a, b)
-    sub  = df.filter(mask)
-
+    sub = df.filter(filtro_faixa_expr(pl.col("H"), pl.col("M"), a, b))
     if sub.is_empty():
-        rows.append((label_faixa(a,b), 0.0, 0.0, 0.0, 0.0, 0.0))
+        rows.append((label_faixa(a,b),
+                     1,0,0,0,0,    # valores
+                     0,0,0,0,0,    # freq
+                     0,            # DIAS_VALIDOS_QCTR
+                     0))           # DIAS_TOTAIS_FAIXA
         continue
 
-    stats = sub.select([
-        pl.mean("Q_CTR").alias("Q_CTR_MEDIA"),
-        pl.mean("Q_ASS").alias("Q_ASS_MEDIA"),
-        pl.mean("Q_COOR").alias("Q_COOR_MEDIA"),
-        pl.mean("QT_CONSOLES").alias("QT_CONSOLES_MEDIA"),
-        pl.mean("Q_POS").alias("Q_POS_MEDIA"),
-    ]).row(0)
+    dias_totais = sub.select("DIA").n_unique()
 
-    rows.append((label_faixa(a,b), *stats))
+    # Moda DIÁRIA — Q_CTR exclui {0,14}; demais sem exclusões
+    m_ctr  = moda_diaria_empate_menor_excl(sub, "DIA", "Q_CTR", excluir={0,14}).rename({"Q_CTR":"CTR_d"})
+    m_ass  = moda_diaria_empate_menor_excl(sub, "DIA", "Q_ASS").rename({"Q_ASS":"ASS_d"})
+    m_coor = moda_diaria_empate_menor_excl(sub, "DIA", "Q_COOR").rename({"Q_COOR":"COOR_d"})
+    m_qtc  = moda_diaria_empate_menor_excl(sub, "DIA", "QT_CONSOLES").rename({"QT_CONSOLES":"QTC_d"})
+    m_qpos = moda_diaria_empate_menor_excl(sub, "DIA", "Q_POS").rename({"Q_POS":"QPOS_d"})
+
+    # Junta por DIA
+    diarias = full_join_safe(m_ctr, m_ass)
+    diarias = full_join_safe(diarias, m_coor)
+    diarias = full_join_safe(diarias, m_qtc)
+    diarias = full_join_safe(diarias, m_qpos)
+
+    # Moda ENTRE DIAS (ignora None; empate -> MENOR)
+    ctr_val,  ctr_freq,  ctr_dias  = moda_entre_dias_empate_menor(diarias, "CTR_d", is_qctr=True)
+    ass_val,  ass_freq,  _         = moda_entre_dias_empate_menor(diarias, "ASS_d")
+    coor_val, coor_freq, _         = moda_entre_dias_empate_menor(diarias, "COOR_d")
+    qtc_val,  qtc_freq,  _         = moda_entre_dias_empate_menor(diarias, "QTC_d")
+    qpos_val, qpos_freq, _         = moda_entre_dias_empate_menor(diarias, "QPOS_d")
+
+    rows.append((label_faixa(a,b),
+                 ctr_val, ass_val, coor_val, qtc_val, qpos_val,
+                 ctr_freq, ass_freq, coor_freq, qtc_freq, qpos_freq,
+                 ctr_dias,
+                 int(dias_totais)))
 
 out = pl.DataFrame(
     rows,
-    schema=["Faixa","Q_CTR_MEDIA","Q_ASS_MEDIA","Q_COOR_MEDIA","QT_CONSOLES_MEDIA","Q_POS_MEDIA"]
+    schema=[
+        "Faixa",
+        "Q_CTR_MODA_DIAS","Q_ASS_MODA_DIAS","Q_COOR_MODA_DIAS","QT_CONSOLES_MODA_DIAS","Q_POS_MODA_DIAS",
+        "Q_CTR_FREQ","Q_ASS_FREQ","Q_COOR_FREQ","QT_CONSOLES_FREQ","Q_POS_FREQ",
+        "DIAS_VALIDOS_QCTR","DIAS_TOTAIS_FAIXA"
+    ]
 )
 
-# ---------- ARREDONDAMENTO ----------
-def arredonda_int(col: str) -> pl.Expr:
-    return pl.col(col).round(0).cast(pl.Int32)
+p("\nPrévia (primeiras linhas):")
+p(out.head(SHOW_SAMPLE).to_pandas().to_string(index=False))
 
-out = out.with_columns([
-    arredonda_int("Q_CTR_MEDIA").alias("Q_CTR_MEDIA"),
-    arredonda_int("Q_ASS_MEDIA").alias("Q_ASS_MEDIA"),
-    arredonda_int("Q_COOR_MEDIA").alias("Q_COOR_MEDIA"),
-    arredonda_int("QT_CONSOLES_MEDIA").alias("QT_CONSOLES_MEDIA"),
-    arredonda_int("Q_POS_MEDIA").alias("Q_POS_MEDIA"),
-])
-
-print("\nMédias por faixa (independente do dia, arredondadas):")
-print(out.to_pandas().to_string(index=False))
-
-# ------------ SAÍDAS ------------
+# -------- Salvar --------
 os.makedirs(OUT_DIR, exist_ok=True)
 out.write_csv(OUT_CSV)
 try:
-    out.write_excel(OUT_XLSX, sheet_name="faixas_media", autofit=True)
+    out.write_excel(OUT_XLSX, sheet_name="moda_dias_QCTR_sem0e14", autofit=True)
+except PermissionError:
+    p(f"[Aviso] Feche o arquivo no Excel se estiver aberto: {OUT_XLSX}")
+    raise
 except Exception:
-    out.to_pandas().to_excel(OUT_XLSX, sheet_name="faixas_media", index=False)
+    out.to_pandas().to_excel(OUT_XLSX, sheet_name="moda_dias_QCTR_sem0e14", index=False)
 
-print("\nArquivos salvos:")
-print(f"- CSV : {OUT_CSV}")
-print(f"- XLSX: {OUT_XLSX}")
+p(f"\nArquivos salvos:\n- CSV : {OUT_CSV}\n- XLSX: {OUT_XLSX}")
+
+# -------- Diagnóstico (imprimindo, com “progresso”) --------
+p("\nDiagnóstico rápido das modas diárias de Q_CTR (excl. 0 e 14):")
+for ini_s, fim_s in tqdm(DIAG_FAIXAS, desc="Diagnóstico", unit="faixa",
+                         disable=DISABLE_TQDM, mininterval=0.2, leave=False):
+    a = parse_hhmm(ini_s); b = parse_hhmm(fim_s)
+    sub = df.filter(filtro_faixa_expr(pl.col("H"), pl.col("M"), a, b))
+    m_ctr = moda_diaria_empate_menor_excl(sub, "DIA", "Q_CTR", excluir={0,14}).rename({"Q_CTR":"CTR_d"})
+    dist = (m_ctr.drop_nulls(subset=["CTR_d"])
+                 .group_by("CTR_d").len().rename({"len":"dias"})
+                 .sort(["dias","CTR_d"], descending=[True, False]))
+    p(f"\n[Faixa {ini_s}-{fim_s}] Top {DIAG_TOPK} valores diários de Q_CTR:")
+    p(dist.head(DIAG_TOPK).to_pandas().to_string(index=False))
