@@ -1,0 +1,257 @@
+# -*- coding: utf-8 -*-
+"""
+Comparativo SBGR – VRA (BRT) x TF (UTC) para 2025-08-28
+
+Entradas (Excel, em C:\BD):
+- SBGR_2025_08_28_VRA.xlsx
+    * Indicativo = 'Sigla ICAO Empresa Aérea' + 'Número Voo'
+    * Estimado de chegada = 'Chegada Prevista' (horário de Brasília)
+- SBGR_2025_08_28_TF.xlsx
+    * Indicativo = 'Indicativo'
+    * Estimado de chegada = 'ETA previsto' (horário UTC)
+
+Saída:
+- C:\Output\Comparativo_SBGR_2025_08_28_TF_vs_VRA.xlsx
+- Gráfico no console (não salva imagem)
+
+Requisitos:
+    pip install pandas openpyxl tqdm pytz matplotlib
+"""
+
+import os
+import re
+import warnings
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pytz
+
+# ----------------------
+# CONFIGURAÇÕES
+# ----------------------
+BASE_DIR   = r"C:\BD"
+OUTPUT_DIR = r"C:\Output"
+FILE_VRA   = os.path.join(BASE_DIR, "SBGR_2025_08_28_VRA.xlsx")
+FILE_TF    = os.path.join(BASE_DIR, "SBGR_2025_08_28_TF.xlsx")
+OUT_XLSX   = os.path.join(OUTPUT_DIR, "Comparativo_SBGR_2025_08_28_TF_vs_VRA.xlsx")
+
+TZ_BRT = pytz.timezone("America/Sao_Paulo")
+TZ_UTC = pytz.UTC
+
+# ----------------------
+# FUNÇÕES AUXILIARES
+# ----------------------
+def to_dt(series: pd.Series) -> pd.Series:
+    """Converte série para datetime (dayfirst=True)."""
+    return pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
+
+def ensure_tz(series: pd.Series, tz) -> pd.Series:
+    """Localiza série naive no fuso 'tz'. Se já tiver tz, apenas converte."""
+    if not pd.api.types.is_datetime64tz_dtype(series):
+        return series.dt.tz_localize(tz)
+    return series.dt.tz_convert(tz)
+
+def as_str_clean(s):
+    return str(s).upper().strip()
+
+def strip_decimal_suffix(s):
+    # remove '.0' ao final de números vindos como float
+    return re.sub(r"\.0$", "", str(s).strip())
+
+# ----------------------
+# ETAPA 1: LEITURA
+# ----------------------
+def load_vra(path_xlsx):
+    """
+    Carrega VRA (BRT):
+    - FLIGHT = 'Sigla ICAO Empresa Aérea' + 'Número Voo'
+    - Chegada Prevista (BRT)
+    """
+    df = pd.read_excel(path_xlsx, engine="openpyxl")
+
+    col_sigla = "Sigla ICAO Empresa Aérea"
+    col_num   = "Número Voo"
+    col_cp    = "Chegada Prevista"
+
+    if col_sigla not in df.columns:
+        prox = [c for c in df.columns if "Sigla ICAO" in c and "Empresa" in c]
+        if prox:
+            col_sigla = prox[0]
+        else:
+            raise ValueError(f"[VRA] Coluna obrigatória ausente: 'Sigla ICAO Empresa Aérea'. Colunas: {list(df.columns)}")
+    if col_num not in df.columns:
+        raise ValueError(f"[VRA] Coluna obrigatória ausente: '{col_num}'. Colunas: {list(df.columns)}")
+    if col_cp not in df.columns:
+        raise ValueError(f"[VRA] Coluna obrigatória ausente: '{col_cp}'. Colunas: {list(df.columns)}")
+
+    vra = pd.DataFrame()
+    vra["Sigla ICAO Empresa Aérea"] = df[col_sigla].map(as_str_clean)
+    vra["Número Voo"] = df[col_num].map(strip_decimal_suffix)
+    vra["FLIGHT"] = (vra["Sigla ICAO Empresa Aérea"] + vra["Número Voo"]).str.replace(r"\s+", "", regex=True)
+
+    vra["Chegada_Prevista_VRA_local"] = to_dt(df[col_cp])
+
+    # fallback: se vier só hora, compõe com a data do arquivo
+    if vra["Chegada_Prevista_VRA_local"].isna().all() or vra["Chegada_Prevista_VRA_local"].dt.date.isna().all():
+        file_date = datetime(2025, 8, 28).date()
+        vra["Chegada_Prevista_VRA_local"] = to_dt(
+            df[col_cp].astype(str).radd(str(file_date) + " ")
+        )
+
+    # Localiza em BRT e cria coluna UTC
+    vra["Chegada_Prevista_VRA_local"] = ensure_tz(vra["Chegada_Prevista_VRA_local"], TZ_BRT)
+    vra["Chegada_Prevista_VRA_UTC"]   = vra["Chegada_Prevista_VRA_local"].dt.tz_convert(TZ_UTC)
+
+    vra = vra[["FLIGHT", "Chegada_Prevista_VRA_local", "Chegada_Prevista_VRA_UTC"]]
+    vra = vra.dropna(subset=["FLIGHT", "Chegada_Prevista_VRA_local"]).drop_duplicates()
+    return vra
+
+def load_tf(path_xlsx):
+    """
+    Carrega TF (UTC):
+    - FLIGHT = 'Indicativo'
+    - ETA previsto (UTC)
+    """
+    df = pd.read_excel(path_xlsx, engine="openpyxl")
+    col_indic = "Indicativo"
+    col_eta   = "ETA previsto"
+
+    if col_indic not in df.columns:
+        raise ValueError(f"[TF] Coluna obrigatória ausente: '{col_indic}'. Colunas: {list(df.columns)}")
+    if col_eta not in df.columns:
+        # tolera variações como 'ETA Previsto', etc.
+        alternativas = [c for c in df.columns if "ETA" in str(c).upper() and "PREV" in str(c).upper()]
+        if alternativas:
+            col_eta = alternativas[0]
+        else:
+            raise ValueError(f"[TF] Coluna obrigatória ausente: '{col_eta}'. Colunas: {list(df.columns)}")
+
+    tf = pd.DataFrame()
+    tf["FLIGHT"] = df[col_indic].map(lambda x: str(x).upper().replace(" ", ""))
+    tf["ETA_previsto_TF_UTC"] = to_dt(df[col_eta])
+    tf["ETA_previsto_TF_UTC"] = ensure_tz(tf["ETA_previsto_TF_UTC"], TZ_UTC)
+
+    tf = tf[["FLIGHT", "ETA_previsto_TF_UTC"]]
+    tf = tf.dropna(subset=["FLIGHT", "ETA_previsto_TF_UTC"]).drop_duplicates()
+    return tf
+
+# ----------------------
+# ETAPA 2: CONSOLIDAÇÃO
+# ----------------------
+def consolidate(vra, tf):
+    """Merge por FLIGHT; em duplicidades, mantém o par com menor |Δt|."""
+    merged = pd.merge(tf, vra, on="FLIGHT", how="inner")
+    if merged.empty:
+        return merged
+
+    merged["abs_dt_diff"] = (merged["Chegada_Prevista_VRA_UTC"] - merged["ETA_previsto_TF_UTC"]).abs()
+    merged = (merged
+              .sort_values(["FLIGHT", "abs_dt_diff"])
+              .drop_duplicates(subset=["FLIGHT"], keep="first"))
+
+    merged["DIFF_MIN"] = (merged["Chegada_Prevista_VRA_UTC"] - merged["ETA_previsto_TF_UTC"]).dt.total_seconds() / 60.0
+    merged["Chegada_Prevista_VRA_BRT"] = merged["Chegada_Prevista_VRA_local"].dt.tz_convert(TZ_BRT)
+
+    cols = ["FLIGHT", "ETA_previsto_TF_UTC", "Chegada_Prevista_VRA_BRT",
+            "Chegada_Prevista_VRA_UTC", "DIFF_MIN"]
+    merged = merged[cols].sort_values(["ETA_previsto_TF_UTC", "FLIGHT"]).reset_index(drop=True)
+    return merged
+
+# ----------------------
+# ETAPA 3: SAÍDA (EXCEL + GRÁFICO)
+# ----------------------
+def save_excel(df_out: pd.DataFrame, path_out: str):
+    """
+    Excel não aceita datetimes timezone-aware.
+    Aqui criamos um DataFrame 'safe' com os horários convertidos para naive:
+    - ETA_previsto_TF_UTC: em UTC naive
+    - Chegada_Prevista_VRA_BRT: em BRT naive
+    - Chegada_Prevista_VRA_UTC: em UTC naive
+    """
+    os.makedirs(os.path.dirname(path_out), exist_ok=True)
+    safe = df_out.copy()
+
+    # Converte colunas datetime tz-aware para naive no fuso desejado
+    if "ETA_previsto_TF_UTC" in safe.columns:
+        safe["ETA_previsto_TF_UTC"] = safe["ETA_previsto_TF_UTC"].dt.tz_convert(TZ_UTC).dt.tz_localize(None)
+    if "Chegada_Prevista_VRA_BRT" in safe.columns:
+        safe["Chegada_Prevista_VRA_BRT"] = safe["Chegada_Prevista_VRA_BRT"].dt.tz_convert(TZ_BRT).dt.tz_localize(None)
+    if "Chegada_Prevista_VRA_UTC" in safe.columns:
+        safe["Chegada_Prevista_VRA_UTC"] = safe["Chegada_Prevista_VRA_UTC"].dt.tz_convert(TZ_UTC).dt.tz_localize(None)
+
+    with pd.ExcelWriter(path_out, engine="openpyxl") as w:
+        safe.to_excel(w, index=False, sheet_name="Comparativo")
+
+def plot_console(df_out: pd.DataFrame):
+    if df_out.empty:
+        print("[AVISO] Nada para plotar.")
+        return
+    plt.figure(figsize=(12, 6))
+    plt.axhline(0, linewidth=1, linestyle="--")
+
+    # eixo X em UTC (naive para plot)
+    x = df_out["ETA_previsto_TF_UTC"].dt.tz_convert(TZ_UTC).dt.tz_localize(None)
+    y = df_out["DIFF_MIN"]
+    plt.scatter(x, y)
+
+    # rótulos
+    for _, r in df_out.iterrows():
+        dt_str = r["ETA_previsto_TF_UTC"].tz_convert(TZ_UTC).strftime("%d/%m %H:%MZ")
+        lbl = f"{dt_str} | {r['FLIGHT']} | {r['DIFF_MIN']:.0f} min"
+        plt.annotate(lbl,
+                     (r["ETA_previsto_TF_UTC"].tz_convert(TZ_UTC).to_pydatetime().replace(tzinfo=None), r["DIFF_MIN"]),
+                     textcoords="offset points", xytext=(0, 6), ha='center', fontsize=8)
+
+    plt.title("SBGR 2025-08-28 – Diferença (min) VRA − TF\n(horários normalizados em UTC)")
+    plt.xlabel("ETA previsto (TF) – UTC")
+    plt.ylabel("Diferença (min) = Chegada Prevista (VRA[BRT]) − ETA previsto (TF[UTC])")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# ----------------------
+# MAIN
+# ----------------------
+def main():
+    warnings.simplefilter("ignore")
+
+    steps = [("Lendo VRA (BRT)", FILE_VRA),
+             ("Lendo TF  (UTC)", FILE_TF),
+             ("Consolidando", None),
+             ("Salvando Excel", OUT_XLSX),
+             ("Plotando no console", None)]
+
+    pbar = tqdm(total=len(steps), desc="Processo")
+
+    # 1) VRA
+    print(f"- {steps[0][0]}: {os.path.basename(FILE_VRA)}")
+    vra = load_vra(FILE_VRA); pbar.update(1)
+
+    # 2) TF
+    print(f"- {steps[1][0]}: {os.path.basename(FILE_TF)}")
+    tf = load_tf(FILE_TF); pbar.update(1)
+
+    # 3) Consolidar
+    print("- Consolidando por FLIGHT (mantendo par mais próximo no tempo)…")
+    df_out = consolidate(vra, tf); pbar.update(1)
+
+    # 4) Salvar (com datetimes naive)
+    print(f"- Salvando planilha em: {OUT_XLSX}")
+    save_excel(df_out, OUT_XLSX); pbar.update(1)
+
+    # Prévia no console
+    print("\nPrévia (até 20 primeiras linhas):")
+    cols_show = ["FLIGHT", "ETA_previsto_TF_UTC", "Chegada_Prevista_VRA_BRT", "DIFF_MIN"]
+    print(df_out[cols_show].head(20).to_string(index=False))
+
+    # 5) Plot
+    print("\n- Gerando gráfico no console…")
+    plot_console(df_out); pbar.update(1)
+
+    pbar.close()
+    print("\nConcluído.")
+
+if __name__ == "__main__":
+    main()
