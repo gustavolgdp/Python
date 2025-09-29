@@ -1,30 +1,46 @@
   WITH RECURSIVE hours AS (
-    SELECT 0 AS h
-    UNION ALL SELECT h+1 FROM hours WHERE h < 23
+    SELECT 0 AS h UNION ALL SELECT h+1 FROM hours WHERE h < 23
   ),
   base AS (
     SELECT
+      sed.id,
       sed.escalas_diarias_criadas_id AS edc_id,
       edc.date                        AS edc_date,
       edc.sub_turno_escala_diaria_id  AS std_id,
       sed.setor_id,
       sed.ativado,
-      sed.horario_sub_turno_id        AS slot_id
+      sed.horario_sub_turno_id        AS slot_id,
+      sed.escalacao_id,
+      esc.entrada_real,
+      esc.saida_real,
+      esc.setor_abriu,
+      esc.folga
     FROM setorizacoes_escala_diarias sed
     JOIN escala_diaria_criadas edc
       ON edc.id = sed.escalas_diarias_criadas_id
+    LEFT JOIN escalacoes_escala_diarias esc
+      ON esc.id = sed.escalacao_id
     WHERE edc.date >= '2023-12-31' AND edc.date <= '2024-12-31'
+      AND sed.ativado = 1
+      AND sed.escalacao_id IS NOT NULL
+      AND esc.setor_abriu = 1
+      AND esc.folga = 0
   ),
   slot_times AS (
     SELECT
       b.*,
-      CAST(JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_inicio'))) AS TIME) AS ini,
-      CAST(JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_fim')))    AS TIME) AS fim
+      CAST(COALESCE(
+        b.entrada_real,
+        JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_inicio')))
+      ) AS TIME) AS ini,
+      CAST(COALESCE(
+        b.saida_real,
+        JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_fim')))
+      ) AS TIME) AS fim
     FROM base b
     JOIN sub_turnos_escala_diarias s
       ON s.id = b.std_id
-    WHERE b.ativado = 1
-      AND JSON_LENGTH(s.horarios) >= b.slot_id
+    WHERE JSON_LENGTH(s.horarios) >= b.slot_id
   ),
   segments AS (
     SELECT edc_id, setor_id, edc_date AS eff_date, TIME_TO_SEC(ini) AS ini_sec, TIME_TO_SEC(fim) AS fim_sec
@@ -49,18 +65,16 @@
       s.eff_date,
       WEEKDAY(s.eff_date) AS wk,
       h.h AS hora,
-      s.setor_id
+      s.setor_id,
+      LEAST(s.fim_sec, (h.h+1)*3600) - GREATEST(s.ini_sec, h.h*3600) AS overlap_sec
     FROM segments_2024 s
     JOIN hours h
-      ON LEAST(s.fim_sec, (h.h+1)*3600) - GREATEST(s.ini_sec, h.h*3600) > 0
+      ON LEAST(s.fim_sec, (h.h+1)*3600) - GREATEST(s.ini_sec, h.h*3600) >= 1800
   ),
   open_by_hour AS (
-    SELECT
-      eff_date,
-      hora,
-      setor_id
+    SELECT eff_date, hora, setor_id
     FROM hour_overlap
-    WHERE wk = 5                 -- sábados
+    WHERE wk = 5
     GROUP BY eff_date, hora, setor_id
   ),
   flags AS (
@@ -99,28 +113,34 @@
     JOIN setors s ON s.id = obh.setor_id
     GROUP BY obh.eff_date, obh.hora
   ),
-  ranked AS (
+  patterns AS (
     SELECT
       hora,
       t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,
       a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
       cn,cl,cs,
       COUNT(*) AS freq,
-      ROW_NUMBER() OVER (
-        PARTITION BY hora
-        ORDER BY COUNT(*) DESC,
-                 CONCAT(
-                   t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,
-                   a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
-                   cn,cl,cs
-                 )
-      ) AS rn
+      CONCAT(
+        t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,
+        a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
+        cn,cl,cs
+      ) AS pat
     FROM flags
     GROUP BY
       hora,
       t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,
       a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
       cn,cl,cs
+  ),
+  ranked AS (
+    SELECT
+      hora,
+      t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,
+      a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
+      cn,cl,cs,
+      freq,
+      ROW_NUMBER() OVER (PARTITION BY hora ORDER BY freq DESC, pat) AS rn
+    FROM patterns
   )
   SELECT
     LPAD(hora,2,'0') AS hora,
