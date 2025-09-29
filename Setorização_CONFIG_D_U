@@ -1,5 +1,10 @@
   WITH RECURSIVE hours AS (
-    SELECT 0 AS h UNION ALL SELECT h+1 FROM hours WHERE h < 23
+    SELECT 0 AS hh
+    UNION ALL SELECT hh+1 FROM hours WHERE hh < 23
+  ),
+  bounds AS (
+    SELECT hh, hh*3600 AS hs, (hh+1)*3600 AS he
+    FROM hours
   ),
   base AS (
     SELECT
@@ -8,17 +13,14 @@
       edc.date                        AS edc_date,
       edc.sub_turno_escala_diaria_id  AS std_id,
       sed.setor_id,
-      sed.ativado,
       sed.horario_sub_turno_id        AS slot_id,
       sed.escalacao_id,
       esc.entrada_real,
-      esc.saida_real,
-      esc.setor_abriu,
-      esc.folga
+      esc.saida_real
     FROM setorizacoes_escala_diarias sed
     JOIN escala_diaria_criadas edc
       ON edc.id = sed.escalas_diarias_criadas_id
-    LEFT JOIN escalacoes_escala_diarias esc
+    JOIN escalacoes_escala_diarias esc
       ON esc.id = sed.escalacao_id
     WHERE edc.date >= '2023-12-31' AND edc.date <= '2024-12-31'
       AND sed.ativado = 1
@@ -29,31 +31,31 @@
   slot_times AS (
     SELECT
       b.*,
-      CAST(COALESCE(
-        b.entrada_real,
-        JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_inicio')))
-      ) AS TIME) AS ini,
-      CAST(COALESCE(
-        b.saida_real,
-        JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_fim')))
-      ) AS TIME) AS fim
+      JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_inicio'))) AS ini_str,
+      JSON_UNQUOTE(JSON_EXTRACT(s.horarios, CONCAT('$[', b.slot_id - 1, '].horario_fim')))    AS fim_str
     FROM base b
     JOIN sub_turnos_escala_diarias s
       ON s.id = b.std_id
     WHERE JSON_LENGTH(s.horarios) >= b.slot_id
   ),
+  slot_times_cast AS (
+    SELECT
+      st.*,
+      CAST(COALESCE(st.entrada_real, st.ini_str) AS TIME) AS ini,
+      CAST(COALESCE(st.saida_real,   st.fim_str) AS TIME) AS fim
+    FROM slot_times st
+  ),
   segments AS (
     SELECT edc_id, setor_id, edc_date AS eff_date, TIME_TO_SEC(ini) AS ini_sec, TIME_TO_SEC(fim) AS fim_sec
-    FROM slot_times
+    FROM slot_times_cast
     WHERE fim > ini
     UNION ALL
     SELECT edc_id, setor_id, edc_date AS eff_date, TIME_TO_SEC(ini) AS ini_sec, 86400 AS fim_sec
-    FROM slot_times
+    FROM slot_times_cast
     WHERE fim <= ini
     UNION ALL
-    SELECT edc_id, setor_id, DATE_ADD(edc_date, INTERVAL 1 DAY) AS eff_date, 0 AS ini_sec, TIME_TO_SEC(fim) AS
-  fim_sec
-    FROM slot_times
+    SELECT edc_id, setor_id, DATE_ADD(edc_date, INTERVAL 1 DAY) AS eff_date, 0 AS ini_sec, TIME_TO_SEC(fim) AS fim_sec
+    FROM slot_times_cast
     WHERE fim <= ini
   ),
   segments_2024 AS (
@@ -64,12 +66,12 @@
     SELECT
       s.eff_date,
       WEEKDAY(s.eff_date) AS wk,
-      h.h AS hora,
+      b.hh AS hora,
       s.setor_id,
-      LEAST(s.fim_sec, (h.h+1)*3600) - GREATEST(s.ini_sec, h.h*3600) AS overlap_sec
+      LEAST(s.fim_sec, b.he) - GREATEST(s.ini_sec, b.hs) AS overlap_sec
     FROM segments_2024 s
-    JOIN hours h
-      ON LEAST(s.fim_sec, (h.h+1)*3600) - GREATEST(s.ini_sec, h.h*3600) >= 1800
+    JOIN bounds b
+      ON LEAST(s.fim_sec, b.he) - GREATEST(s.ini_sec, b.hs) >= 1800
   ),
   open_by_hour AS (
     SELECT eff_date, hora, setor_id
@@ -132,18 +134,24 @@
       a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
       cn,cl,cs
   ),
+  totals AS (
+    SELECT hora, COUNT(*) AS total
+    FROM flags
+    GROUP BY hora
+  ),
   ranked AS (
     SELECT
-      hora,
-      t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,
-      a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,
-      cn,cl,cs,
-      freq,
-      ROW_NUMBER() OVER (PARTITION BY hora ORDER BY freq DESC, pat) AS rn
-    FROM patterns
+      p.hora,
+      p.t1,p.t2,p.t3,p.t4,p.t5,p.t6,p.t7,p.t8,p.t9,p.t10,p.t11,p.t12,p.t13,p.t14,
+      p.a1,p.a2,p.a3,p.a4,p.a5,p.a6,p.a7,p.a8,p.a9,p.a10,p.a11,p.a12,p.a13,p.a14,
+      p.cn,p.cl,p.cs,
+      p.freq, t.total,
+      ROW_NUMBER() OVER (PARTITION BY p.hora ORDER BY p.freq DESC, p.pat) AS rn
+    FROM patterns p
+    JOIN totals t ON t.hora = p.hora
   )
   SELECT
-    LPAD(hora,2,'0') AS hora,
+    LPAD(hora,2,'0') AS `hora`,
     CASE WHEN t1  =1 THEN 'x' ELSE '' END AS `T1`,
     CASE WHEN t2  =1 THEN 'x' ELSE '' END AS `T2`,
     CASE WHEN t3  =1 THEN 'x' ELSE '' END AS `T3`,
@@ -174,7 +182,8 @@
     CASE WHEN a14 =1 THEN 'x' ELSE '' END AS `A14`,
     CASE WHEN cn  =1 THEN 'x' ELSE '' END AS `CN`,
     CASE WHEN cl  =1 THEN 'x' ELSE '' END AS `CL`,
-    CASE WHEN cs  =1 THEN 'x' ELSE '' END AS `CS`
+    CASE WHEN cs  =1 THEN 'x' ELSE '' END AS `CS`,
+    ROUND(100.0*freq/total,1) AS `pct_config`
   FROM ranked
   WHERE rn = 1
-  ORDER BY HORA;
+  ORDER BY hora;
