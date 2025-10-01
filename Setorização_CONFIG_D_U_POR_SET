@@ -1,0 +1,303 @@
+ -- Parâmetros
+  SET @start := '2024-01-01';
+  SET @end   := '2025-01-01';
+  SET @min_overlap_sec := 900;      -- 900=15min, 1800=30min
+  SET @prefer_real_times := 1;      -- 1=usa reais quando houver; 0=sempre planejado
+
+  SET SESSION group_concat_max_len = 1000000;
+
+  -- Horas 0..23 (cada hora = 3600s)
+  DROP TEMPORARY TABLE IF EXISTS hours;
+  CREATE TEMPORARY TABLE hours (hh INT NOT NULL, hs INT NOT NULL, he INT NOT NULL);
+  INSERT INTO hours (hh, hs, he) VALUES
+  (0,0,3600),(1,3600,7200),(2,7200,10800),(3,10800,14400),
+  (4,14400,18000),(5,18000,21600),(6,21600,25200),(7,25200,28800),
+  (8,28800,32400),(9,32400,36000),(10,36000,39600),(11,39600,43200),
+  (12,43200,46800),(13,46800,50400),(14,50400,54000),(15,54000,57600),
+  (16,57600,61200),(17,61200,64800),(18,64800,68400),(19,68400,72000),
+  (20,72000,75600),(21,75600,79200),(22,79200,82800),(23,82800,86400);
+
+  -- Base: horários efetivos (reais com fallback ao planejado do JSON em sub_turnos_escala_diarias.horarios)
+  DROP TEMPORARY TABLE IF EXISTS base;
+  CREATE TEMPORARY TABLE base AS
+  SELECT
+  edc.date     AS edc_date,
+  sed.setor_id AS setor_id,
+  COALESCE(
+  CASE WHEN @prefer_real_times=1 THEN esc.entrada_real END,
+  COALESCE(
+  STR_TO_DATE(
+  COALESCE(
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"horario_inicio":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"horario_inicio":"',-1),'"',1)
+  END,
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"inicio":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"inicio":"',-1),'"',1)
+  END
+  ),
+  '%H:%i:%s'
+  ),
+  STR_TO_DATE(
+  COALESCE(
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"horario_inicio":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"horario_inicio":"',-1),'"',1)
+  END,
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"inicio":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"inicio":"',-1),'"',1)
+  END
+  ),
+  '%H:%i'
+  )
+  )
+  ) AS ini_time,
+  COALESCE(
+  CASE WHEN @prefer_real_times=1 THEN esc.saida_real END,
+  COALESCE(
+  STR_TO_DATE(
+  COALESCE(
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"horario_fim":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"horario_fim":"',-1),'"',1)
+  END,
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"fim":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"fim":"',-1),'"',1)
+  END
+  ),
+  '%H:%i:%s'
+  ),
+  STR_TO_DATE(
+  COALESCE(
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"horario_fim":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"horario_fim":"',-1),'"',1)
+  END,
+  CASE WHEN REPLACE(st.horarios,' ','') LIKE '%"fim":"%'
+  THEN SUBSTRING_INDEX(SUBSTRING_INDEX(REPLACE(st.horarios,' ',''),'"fim":"',-1),'"',1)
+  END
+  ),
+  '%H:%i'
+  )
+  )
+  ) AS fim_time
+  FROM setorizacoes_escala_diarias    AS sed
+  JOIN escala_diaria_criadas          AS edc ON edc.id = sed.escalas_diarias_criadas_id
+  JOIN escalacoes_escala_diarias      AS esc ON esc.id = sed.escalacao_id
+  LEFT JOIN sub_turnos_escala_diarias AS st  ON st.id  = esc.horario_sub_turno_id
+  WHERE edc.date >= DATE_SUB(@start, INTERVAL 1 DAY) AND edc.date < @end
+  AND sed.ativado      = 1
+  AND sed.escalacao_id IS NOT NULL
+  AND esc.setor_abriu  = 1
+  AND esc.folga        = 0;
+
+  -- Segmentos (trata cruzar 00:00; descarta tempos nulos)
+  DROP TEMPORARY TABLE IF EXISTS segments;
+  CREATE TEMPORARY TABLE segments (
+  eff_date DATE NOT NULL,
+  setor_id BIGINT NOT NULL,
+  ini_sec INT NOT NULL,
+  fim_sec INT NOT NULL
+  );
+
+  INSERT INTO segments (eff_date, setor_id, ini_sec, fim_sec)
+  SELECT edc_date, setor_id, TIME_TO_SEC(ini_time), TIME_TO_SEC(fim_time)
+  FROM base
+  WHERE ini_time IS NOT NULL AND fim_time IS NOT NULL
+  AND TIME_TO_SEC(fim_time) > TIME_TO_SEC(ini_time);
+
+  INSERT INTO segments (eff_date, setor_id, ini_sec, fim_sec)
+  SELECT edc_date, setor_id, TIME_TO_SEC(ini_time), 86400
+  FROM base
+  WHERE ini_time IS NOT NULL AND fim_time IS NOT NULL
+  AND TIME_TO_SEC(fim_time) <= TIME_TO_SEC(ini_time);
+
+  INSERT INTO segments (eff_date, setor_id, ini_sec, fim_sec)
+  SELECT DATE_ADD(edc_date, INTERVAL 1 DAY), setor_id, 0, TIME_TO_SEC(fim_time)
+  FROM base
+  WHERE ini_time IS NOT NULL AND fim_time IS NOT NULL
+  AND TIME_TO_SEC(fim_time) <= TIME_TO_SEC(ini_time);
+
+  -- Recorte do período + índices
+  DROP TEMPORARY TABLE IF EXISTS segments_rng;
+  CREATE TEMPORARY TABLE segments_rng AS
+  SELECT eff_date, setor_id, ini_sec, fim_sec
+  FROM segments
+  WHERE eff_date >= @start AND eff_date < @end;
+  ALTER TABLE segments_rng ADD INDEX seg_e (eff_date), ADD INDEX seg_es (eff_date,setor_id);
+
+  -- Sobreposição por hora (>= @min_overlap_sec) + índice
+  DROP TEMPORARY TABLE IF EXISTS hour_overlap;
+  CREATE TEMPORARY TABLE hour_overlap AS
+  SELECT
+  s.eff_date,
+  h.hh AS hora,
+  s.setor_id,
+  LEAST(s.fim_sec, h.he) - GREATEST(s.ini_sec, h.hs) AS overlap_sec
+  FROM segments_rng AS s
+  JOIN hours       AS h
+  ON LEAST(s.fim_sec, h.he) - GREATEST(s.ini_sec, h.hs) >= @min_overlap_sec;
+  ALTER TABLE hour_overlap ADD INDEX hov_ehs (eff_date,hora,setor_id);
+
+  -- Mapeia posições por ordem (T1..T14, A1..A14, CN/CL/CS) de forma tolerante
+  DROP TEMPORARY TABLE IF EXISTS target_sectors_all;
+  CREATE TEMPORARY TABLE target_sectors_all AS
+  SELECT
+  s.id AS setor_id,
+  CASE
+  WHEN LEFT(LOWER(REPLACE(TRIM(s.nome),' ','')),1)='t'
+  AND CAST(SUBSTRING(LOWER(REPLACE(TRIM(s.nome),' ','')),2) AS UNSIGNED) BETWEEN 1 AND 14
+  THEN CAST(SUBSTRING(LOWER(REPLACE(TRIM(s.nome),' ','')),2) AS UNSIGNED)
+  WHEN LEFT(LOWER(REPLACE(TRIM(s.nome),' ','')),1)='a'
+  AND CAST(SUBSTRING(LOWER(REPLACE(TRIM(s.nome),' ','')),2) AS UNSIGNED) BETWEEN 1 AND 14
+  THEN 14 + CAST(SUBSTRING(LOWER(REPLACE(TRIM(s.nome),' ','')),2) AS UNSIGNED)
+  WHEN LOWER(REPLACE(TRIM(s.nome),' ',''))='cn' THEN 29
+  WHEN LOWER(REPLACE(TRIM(s.nome),' ',''))='cl' THEN 30
+  WHEN LOWER(REPLACE(TRIM(s.nome),' ',''))='cs' THEN 31
+  ELSE NULL
+  END AS ord
+  FROM setors AS s;
+  DELETE FROM target_sectors_all WHERE ord IS NULL OR ord<1 OR ord>31;
+  ALTER TABLE target_sectors_all ADD INDEX tsa_sid (setor_id), ADD INDEX tsa_ord (ord);
+
+  -- Calendário de dias úteis (datas existentes na tabela de escala diária)
+  DROP TEMPORARY TABLE IF EXISTS calendar_weekdays;
+  CREATE TEMPORARY TABLE calendar_weekdays AS
+  SELECT DISTINCT edc.date AS eff_date
+  FROM escala_diaria_criadas edc
+  WHERE edc.date >= @start AND edc.date < @end
+  AND WEEKDAY(edc.date) BETWEEN 0 AND 4;
+  ALTER TABLE calendar_weekdays ADD INDEX cw_e (eff_date);
+
+  -- Mapa fixo de colunas
+  DROP TEMPORARY TABLE IF EXISTS pos_map;
+  CREATE TEMPORARY TABLE pos_map (ord INT PRIMARY KEY, pos_label VARCHAR(4));
+  INSERT INTO pos_map (ord,pos_label) VALUES
+  ( 1,'T1'),( 2,'T2'),( 3,'T3'),( 4,'T4'),( 5,'T5'),( 6,'T6'),( 7,'T7'),( 8,'T8'),
+  ( 9,'T9'),(10,'T10'),(11,'T11'),(12,'T12'),(13,'T13'),(14,'T14'),
+  (15,'A1'),(16,'A2'),(17,'A3'),(18,'A4'),(19,'A5'),(20,'A6'),(21,'A7'),(22,'A8'),
+  (23,'A9'),(24,'A10'),(25,'A11'),(26,'A12'),(27,'A13'),(28,'A14'),
+  (29,'CN'),(30,'CL'),(31,'CS');
+
+  -- Grade (dias úteis × 24h × 31 posições) + índice
+  DROP TEMPORARY TABLE IF EXISTS grid_ord;
+  CREATE TEMPORARY TABLE grid_ord AS
+  SELECT cw.eff_date, h.hh AS hora, pm.ord
+  FROM calendar_weekdays cw
+  CROSS JOIN hours h
+  CROSS JOIN pos_map pm;
+  ALTER TABLE grid_ord ADD INDEX grid_eho (eff_date,hora,ord);
+
+  -- Sobreposições agregadas por posição (ord) + índice
+  DROP TEMPORARY TABLE IF EXISTS hov_ord;
+  CREATE TEMPORARY TABLE hov_ord AS
+  SELECT DISTINCT hk.eff_date, hk.hora, tsa.ord
+  FROM hour_overlap hk
+  JOIN target_sectors_all tsa ON tsa.setor_id = hk.setor_id;
+  ALTER TABLE hov_ord ADD INDEX ho_eho (eff_date,hora,ord);
+
+  -- Bits por célula (0/1)
+  DROP TEMPORARY TABLE IF EXISTS bits_ord;
+  CREATE TEMPORARY TABLE bits_ord AS
+  SELECT
+  g.eff_date,
+  g.hora,
+  g.ord,
+  CASE WHEN EXISTS (
+  SELECT 1 FROM hov_ord ho
+  WHERE ho.eff_date = g.eff_date
+  AND ho.hora     = g.hora
+  AND ho.ord      = g.ord
+  ) THEN 1 ELSE 0 END AS bit
+  FROM grid_ord g;
+  ALTER TABLE bits_ord ADD INDEX bo_eho (eff_date,hora,ord);
+
+  -- Contagens por célula (ord × hora)
+  DROP TEMPORARY TABLE IF EXISTS cell_counts;
+  CREATE TEMPORARY TABLE cell_counts AS
+  SELECT
+  bo.ord,
+  bo.hora,
+  SUM(bo.bit) AS days_open,
+  COUNT(1)    AS total_days
+  FROM bits_ord bo
+  GROUP BY bo.ord, bo.hora;
+  ALTER TABLE cell_counts ADD INDEX cc_oh (ord,hora);
+
+  -- Matriz hora × posição (x = >50% dos dias úteis)
+  SELECT
+  LPAD(h.hh,2,'0') AS hora,
+  IF(MAX(CASE WHEN pm.ord= 1 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T1,
+  IF(MAX(CASE WHEN pm.ord= 2 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T2,
+  IF(MAX(CASE WHEN pm.ord= 3 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T3,
+  IF(MAX(CASE WHEN pm.ord= 4 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T4,
+  IF(MAX(CASE WHEN pm.ord= 5 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T5,
+  IF(MAX(CASE WHEN pm.ord= 6 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T6,
+  IF(MAX(CASE WHEN pm.ord= 7 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T7,
+  IF(MAX(CASE WHEN pm.ord= 8 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T8,
+  IF(MAX(CASE WHEN pm.ord= 9 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T9,
+  IF(MAX(CASE WHEN pm.ord=10 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T10,
+  IF(MAX(CASE WHEN pm.ord=11 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T11,
+  IF(MAX(CASE WHEN pm.ord=12 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T12,
+  IF(MAX(CASE WHEN pm.ord=13 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T13,
+  IF(MAX(CASE WHEN pm.ord=14 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS T14,
+  IF(MAX(CASE WHEN pm.ord=15 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A1,
+  IF(MAX(CASE WHEN pm.ord=16 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A2,
+  IF(MAX(CASE WHEN pm.ord=17 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A3,
+  IF(MAX(CASE WHEN pm.ord=18 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A4,
+  IF(MAX(CASE WHEN pm.ord=19 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A5,
+  IF(MAX(CASE WHEN pm.ord=20 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A6,
+  IF(MAX(CASE WHEN pm.ord=21 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A7,
+  IF(MAX(CASE WHEN pm.ord=22 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A8,
+  IF(MAX(CASE WHEN pm.ord=23 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A9,
+  IF(MAX(CASE WHEN pm.ord=24 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A10,
+  IF(MAX(CASE WHEN pm.ord=25 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A11,
+  IF(MAX(CASE WHEN pm.ord=26 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A12,
+  IF(MAX(CASE WHEN pm.ord=27 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A13,
+  IF(MAX(CASE WHEN pm.ord=28 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS A14,
+  IF(MAX(CASE WHEN pm.ord=29 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS CN,
+  IF(MAX(CASE WHEN pm.ord=30 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS CL,
+  IF(MAX(CASE WHEN pm.ord=31 THEN (CASE WHEN cc.days_open > (cc.total_days/2.0) THEN 1 ELSE 0 END) END)=1,'x','')
+  AS CS
+  FROM hours h
+  LEFT JOIN cell_counts cc ON cc.hora = h.hh
+  LEFT JOIN pos_map pm     ON pm.ord = cc.ord
+  GROUP BY h.hh
+  ORDER BY h.hh;
+  
+    -- Porcentagem por posição × hora
+  SELECT
+  LPAD(cc.hora,2,'0') AS hora,
+  pm.pos_label        AS posicao,
+  cc.days_open,
+  cc.total_days,
+  ROUND(100.0 * cc.days_open / cc.total_days, 1) AS pct_open
+  FROM cell_counts cc
+  JOIN pos_map pm ON pm.ord = cc.ord
+  ORDER BY cc.hora, pm.ord;
