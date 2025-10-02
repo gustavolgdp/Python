@@ -1,0 +1,67 @@
+  WITH base AS (
+  SELECT
+  CONCAT(
+  JSON_UNQUOTE(JSON_EXTRACT(st.horarios, CONCAT('$[', s.horario_sub_turno_id - 1, '].horario_inicio'))),
+  ' - ',
+  JSON_UNQUOTE(JSON_EXTRACT(st.horarios, CONCAT('$[', s.horario_sub_turno_id - 1, '].horario_fim')))
+  ) AS faixa,
+  STR_TO_DATE(
+  JSON_UNQUOTE(JSON_EXTRACT(st.horarios, CONCAT('$[', s.horario_sub_turno_id - 1, '].horario_inicio'))),
+  '%H:%i:%s'
+  ) AS hora_inicio,
+  se.nome AS setor,
+  e.date AS dt,
+  s.ativado
+  FROM setorizacoes_escala_diarias s
+  JOIN escala_diaria_criadas e
+  ON e.id = s.escalas_diarias_criadas_id
+  JOIN sub_turnos_escala_diarias st
+  ON st.id = e.sub_turno_escala_diaria_id
+  JOIN setors se
+  ON se.id = s.setor_id
+  WHERE WEEKDAY(e.date) BETWEEN 0 AND 4  -- 0=Seg, 4=Sex
+  ),
+  agg AS (
+  SELECT
+  faixa,
+  hora_inicio,
+  setor,
+  SUM(ativado) AS sum_ativado,
+  COUNT(DISTINCT dt) AS dias
+  FROM base
+  GROUP BY faixa, hora_inicio, setor
+  )
+  SELECT
+  faixa,
+  ROUND(MAX(CASE WHEN setor = 't1'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t1,
+  ROUND(MAX(CASE WHEN setor = 'a1'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a1,
+  ROUND(MAX(CASE WHEN setor = 't2'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t2,
+  ROUND(MAX(CASE WHEN setor = 'a2'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a2,
+  ROUND(MAX(CASE WHEN setor = 't3'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t3,
+  ROUND(MAX(CASE WHEN setor = 'a3'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a3,
+  ROUND(MAX(CASE WHEN setor = 't4'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t4,
+  ROUND(MAX(CASE WHEN setor = 'a4'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a4,
+  ROUND(MAX(CASE WHEN setor = 't5'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t5,
+  ROUND(MAX(CASE WHEN setor = 'a5'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a5,
+  ROUND(MAX(CASE WHEN setor = 't6'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t6,
+  ROUND(MAX(CASE WHEN setor = 'a6'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a6,
+  ROUND(MAX(CASE WHEN setor = 't7'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t7,
+  ROUND(MAX(CASE WHEN setor = 'a7'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a7,
+  ROUND(MAX(CASE WHEN setor = 't8'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t8,
+  ROUND(MAX(CASE WHEN setor = 'a8'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a8,
+  ROUND(MAX(CASE WHEN setor = 't9'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t9,
+  ROUND(MAX(CASE WHEN setor = 't10' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t10,
+  ROUND(MAX(CASE WHEN setor = 't11' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t11,
+  ROUND(MAX(CASE WHEN setor = 't12' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t12,
+  ROUND(MAX(CASE WHEN setor = 'a12' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a12,
+  ROUND(MAX(CASE WHEN setor = 't13' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t13,
+  ROUND(MAX(CASE WHEN setor = 'a13' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a13,
+  ROUND(MAX(CASE WHEN setor = 't14' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS t14,
+  ROUND(MAX(CASE WHEN setor = 'a14' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS a14,
+  ROUND(MAX(CASE WHEN setor = 'cn'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS cn,
+  ROUND(MAX(CASE WHEN setor = 'cl'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS cl,
+  ROUND(MAX(CASE WHEN setor = 'cs'  THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS cs,
+  ROUND(MAX(CASE WHEN setor = 'sup' THEN 100 * sum_ativado / NULLIF(dias,0) END), 1) AS sup
+  FROM agg
+  GROUP BY faixa
+  ORDER BY MIN(hora_inicio);
