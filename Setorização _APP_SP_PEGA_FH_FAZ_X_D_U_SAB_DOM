@@ -1,0 +1,133 @@
+  import re
+  from pathlib import Path
+  import pandas as pd
+
+  PATH_UTEIS = Path(r"C:\BD\CONFIG_APP_SP_D_U_BRUTA.csv")
+  PATH_SAB   = Path(r"C:\BD\CONFIG_APP_SP_SAB_BRUTA.csv")
+  PATH_DOM   = Path(r"C:\BD\CONFIG_APP_SP_DOM_BRUTA.csv")
+  OUT_PATH   = Path(r"C:\BD\ativacao_x_uteis_sab_dom.csv")
+
+  ALL_COLS = (
+  [f"T{i}" for i in range(1, 15)]
+  + [f"A{i}" for i in range(1, 15)]
+  + ["CN", "CS", "CL"]
+  )
+
+  THRESHOLD = 50.0  # porcentagem
+
+  time_re = re.compile(r"^(\d{2}:\d{2}(?::\d{2})?)\s*-\s*(\d{2}:\d{2}(?::\d{2})?)$")
+
+  def to_seconds(tstr: str) -> int:
+  parts = tstr.split(":")
+  hh = int(parts[0]) % 24
+  mm = int(parts[1]) if len(parts) > 1 else 0
+  ss = int(parts[2]) if len(parts) > 2 else 0
+  return hh * 3600 + mm * 60 + ss
+
+  def covered_hours(h_ini: int, h_fim: int):
+  if h_fim >= h_ini:
+  return list(range(h_ini, h_fim + 1))
+  return list(range(h_ini, 24)) + list(range(0, h_fim + 1))
+
+  def load_bruta_as_x_table(path: Path, title: str) -> pd.DataFrame:
+  # Leitura robusta
+  try:
+  df = pd.read_csv(path, sep=';', encoding='utf-8-sig', dtype=str)
+  except UnicodeDecodeError:
+  df = pd.read_csv(path, sep=';', encoding='latin-1', dtype=str)
+
+      # Normaliza cabeçalhos
+      df.columns = [c.strip().strip('"') for c in df.columns]
+
+      # Detecta coluna de faixa
+      label_col = None
+      for cand in ("faixa_hora", "faixa"):
+          if cand in df.columns:
+              label_col = cand
+              break
+      if label_col is None:
+          raise RuntimeError(f"Coluna de faixa ausente em {path}")
+
+      # Limpa e converte numéricos
+      def clean_numeric(s: pd.Series) -> pd.Series:
+          return (s.astype(str)
+                    .replace({'\\N': ''}, regex=False)
+                    .str.replace('"', '', regex=False)
+                    .str.replace(',', '.', regex=False))
+
+      # Mapa de colunas de setores (preserva caixa original)
+      col_map = {c.lower(): c for c in df.columns if c.lower() != label_col.lower()}
+
+      # Converte já existentes
+      for _, orig_col in list(col_map.items()):
+          df[orig_col] = pd.to_numeric(clean_numeric(df[orig_col]), errors='coerce')
+
+      # Garante todas as colunas pedidas
+      for col in ALL_COLS:
+          if col.lower() not in col_map:
+              df[col] = 0.0
+              col_map[col.lower()] = col
+
+      # Parse das faixas
+      starts, ends = [], []
+      for v in df[label_col].astype(str):
+          m = time_re.match(v.strip())
+          if not m:
+              raise ValueError(f"Faixa inválida: {v}")
+          s_str, e_str = m.group(1), m.group(2)
+          ssec = to_seconds(s_str)
+          esec = to_seconds(e_str)
+          esec_adj = (esec - 1) % 86400  # fim exclusivo
+          starts.append(ssec)
+          ends.append(esec_adj)
+      df['start_sec'] = starts
+      df['end_sec_adj'] = ends
+      df['h_ini'] = (df['start_sec'] // 3600).astype(int)
+      df['h_fim'] = (df['end_sec_adj'] // 3600).astype(int)
+
+      # Expansão por horas cobertas
+      df['hours_list'] = [covered_hours(hi, hf) for hi, hf in zip(df['h_ini'], df['h_fim'])]
+      df_exp = df[[label_col, 'hours_list'] + [col_map[c.lower()] for c in ALL_COLS]].explode('hours_list',
+  ignore_index=True)
+      df_exp = df_exp.rename(columns={'hours_list': 'hour_index'})
+
+      # Média por hora cheia (quando houver sobreposição de faixas)
+      agg = df_exp.groupby('hour_index', as_index=False).agg({col_map[c.lower()]: 'mean' for c in ALL_COLS})
+      agg = agg.sort_values('hour_index')
+
+      # Faixas de hora cheias
+      agg['faixa_hora'] = agg['hour_index'].apply(lambda h: f"{h:02d}:00 - {(h+1)%24:02d}:00")
+
+      # Ordena colunas
+      pct_cols = [col_map[c.lower()] for c in ALL_COLS]
+      df_pct = agg[['faixa_hora'] + pct_cols].copy()
+
+      # Aplica limiar
+      df_x = df_pct.copy()
+      for col in pct_cols:
+          df_x[col] = df_pct[col].apply(lambda v: 'x' if pd.notna(v) and float(v) > THRESHOLD else '')
+
+      # Título (linha acima da tabela)
+      header_row = pd.DataFrame({"faixa_hora": [title]})
+      # Junta título + cabeçalho + tabela
+      header = pd.DataFrame(columns=df_x.columns)
+      header.loc[0] = df_x.columns  # primeira linha como cabeçalho textual
+      out_block = pd.concat([header_row, header, df_x], ignore_index=True)
+      return out_block
+
+  def main():
+  blocks = []
+  blocks.append(load_bruta_as_x_table(PATH_UTEIS, "DIAS ÚTEIS (>50%)"))
+  # duas linhas em branco
+  blocks.append(pd.DataFrame({"faixa_hora": ["", ""]}))
+  blocks.append(load_bruta_as_x_table(PATH_SAB, "SÁBADOS (>50%)"))
+  blocks.append(pd.DataFrame({"faixa_hora": ["", ""]}))
+  blocks.append(load_bruta_as_x_table(PATH_DOM, "DOMINGOS (>50%)"))
+
+      # Concatena e salva; usa ';' para Excel/Heidi
+      out_df = pd.concat(blocks, ignore_index=True)
+      out_df.to_csv(OUT_PATH, sep=';', index=False, header=False, encoding='utf-8-sig')
+      print(f"Geração concluída: {OUT_PATH}")
+
+  if name == "main":
+  main()
