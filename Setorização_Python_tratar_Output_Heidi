@@ -1,0 +1,108 @@
+ 1     +import re
+    2     +from pathlib import Path
+    3     +import pandas as pd
+    4     +
+    5     +IN_PATH = Path(r"C:\BD\CONFIG_APP_SP_D_U_BRUTA.csv")
+    6     +OUT_PATH = Path(r"C:\BD\ativacao_pct_horas_uteis_fullcols_horas_cheias.csv")
+    7     +
+    8     +ALL_COLS = (
+    9     +    [f"t{i}" for i in range(1, 15)]
+    10    +    + [f"a{i}" for i in range(1, 15)]
+    11    +    + ["cn", "cs", "cl"]
+    12    +)
+    13    +
+    14    +time_re = re.compile(r"^(\d{2}:\d{2}(?::\d{2})?)\s*-\s*(\d{2}:\d{2}(?::\d{2})?)$")
+    15    +
+    16    +def to_seconds(tstr: str) -> int:
+    17    +    parts = tstr.split(":")
+    18    +    hh = int(parts[0]) % 24
+    19    +    mm = int(parts[1]) if len(parts) > 1 else 0
+    20    +    ss = int(parts[2]) if len(parts) > 2 else 0
+    21    +    return hh * 3600 + mm * 60 + ss
+    22    +
+    23    +def covered_hours(h_ini: int, h_fim: int):
+    28    +def main():
+    29    +    # Read CSV robustly
+    30    +    try:
+    31    +        df = pd.read_csv(IN_PATH, sep=';', encoding='utf-8-sig', dtype=str)
+    32    +    except UnicodeDecodeError:
+    33    +        df = pd.read_csv(IN_PATH, sep=';', encoding='latin-1', dtype=str)
+    34    +
+    35    +    # Normalize columns
+    36    +    df.columns = [c.strip().strip('"') for c in df.columns]
+    37    +
+    38    +    # Identify faixa column
+    39    +    label_col = None
+    40    +    for cand in ("faixa_hora", "faixa"):
+    41    +        if cand in df.columns:
+    42    +            label_col = cand
+    43    +            break
+    44    +    if label_col is None:
+    45    +        raise RuntimeError("Coluna de faixa não encontrada (esperado: faixa_hora ou faixa)")
+    46    +
+    47    +    # Clean numeric columns (replace decimal comma, remove quotes, map \N)
+    48    +    def clean_numeric(s: pd.Series) -> pd.Series:
+    49    +        return (s.astype(str)
+    50    +                  .replace({'\\N': ''}, regex=False)
+    51    +                  .str.replace('"', '', regex=False)
+    52    +                  .str.replace(',', '.', regex=False))
+    53    +
+    54    +    # Ensure numeric columns exist and convert
+    55    +    present_cols = set(c.lower() for c in df.columns)
+    56    +    # Some files may have uppercase headers (T1, A1...) — map to lowercase
+    57    +    # Build a mapping for existing sector columns regardless of case
+    58    +    col_map = {c.lower(): c for c in df.columns if c.lower() != label_col.lower()}
+    59    +
+    60    +    # Convert existing sector columns to float
+    61    +    for k_lower, orig_col in list(col_map.items()):
+    62    +        df[orig_col] = pd.to_numeric(clean_numeric(df[orig_col]), errors='coerce')
+    63    +
+    64    +    # Create missing sector columns as 0.0
+    65    +    for col in ALL_COLS:
+    66    +        if col not in col_map:
+    67    +            df[col] = 0.0
+    68    +            col_map[col] = col
+    69    +
+    70    +    # Parse faixa ranges to seconds
+    71    +    starts = []
+    72    +    ends = []
+    73    +    for v in df[label_col].astype(str):
+    74    +        m = time_re.match(v.strip())
+    75    +        if not m:
+    76    +            raise ValueError(f"Faixa inválida: {v}")
+    77    +        s_str, e_str = m.group(1), m.group(2)
+    78    +        ssec = to_seconds(s_str)
+    79    +        esec = to_seconds(e_str)
+    80    +        # make end exclusive by subtracting 1 second
+    81    +        esec_adj = (esec - 1) % 86400
+    82    +        starts.append(ssec)
+    83    +        ends.append(esec_adj)
+    84    +    df['start_sec'] = starts
+    85    +    df['end_sec_adj'] = ends
+    86    +    df['h_ini'] = (df['start_sec'] // 3600).astype(int)
+    87    +    df['h_fim'] = (df['end_sec_adj'] // 3600).astype(int)
+    88    +
+    89    +    # Expand per covered hour
+    90    +    df['hours_list'] = [covered_hours(hi, hf) for hi, hf in zip(df['h_ini'], df['h_fim'])]
+    91    +    df_exp = df[[label_col, 'hours_list'] + [col_map[c] for c in ALL_COLS]].explode('hours_list', ignore_
+           index=True)
+    92    +    df_exp = df_exp.rename(columns={'hours_list': 'hour_index'})
+    93    +
+    94    +    # Aggregate by hour: pick the max value across overlapping slots
+    95    +    agg = df_exp.groupby('hour_index', as_index=False).agg({col_map[c]: 'max' for c in ALL_COLS})
+    96    +    agg = agg.sort_values('hour_index')
+    97    +
+    98    +    # Build output with proper faixa_hora labels
+    99    +    agg['faixa_hora'] = agg['hour_index'].apply(lambda h: f"{h:02d}:00 - {(h+1)%24:02d}:00")
+    100   +
+    101   +    # Order columns: faixa_hora + ALL_COLS in order (use lower case keys to find original case)
+    102   +    out_cols = ['faixa_hora'] + [col_map[c] for c in ALL_COLS]
+    103   +    df_out = agg[out_cols]
+    104   +
+    105   +    # Save
+    106   +    df_out.to_csv(OUT_PATH, sep=';', index=False, encoding='utf-8-sig', float_format='%.1f')
+    107   +    print(f"Gerado: {OUT_PATH}")
+    108   +
+    109   +if __name__ == '__main__':
+    110   +    main()
+    111   +
