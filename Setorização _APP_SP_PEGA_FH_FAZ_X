@@ -1,0 +1,44 @@
+  from pathlib import Path
+  import pandas as pd
+
+  IN_PATH = Path(r"C:\BD\ativacao_pct_horas_uteis_fullcols_horas_cheias_media.csv")
+  OUT_PATH = Path(r"C:\BD\ativacao_pct_horas_uteis_fullcols_horas_cheias_media_x.csv")
+
+  THRESHOLD = 40.0  # porcentagem
+
+  def main():
+  # Leitura robusta do CSV com separador ';'
+  try:
+  df = pd.read_csv(IN_PATH, sep=';', encoding='utf-8-sig', dtype=str)
+  except UnicodeDecodeError:
+  df = pd.read_csv(IN_PATH, sep=';', encoding='latin-1', dtype=str)
+
+      # Detecta coluna de rótulo (faixa ou faixa_hora)
+      label_col = None
+      for c in df.columns:
+          cl = c.strip().strip('"').lower()
+          if cl in ("faixa_hora", "faixa"):
+              label_col = c
+              break
+      if not label_col:
+          raise RuntimeError('Coluna de faixa não encontrada (esperado: faixa_hora ou faixa)')
+
+      # Mantém ordem original das colunas
+      cols = list(df.columns)
+
+      # Aplica limiar nas colunas numéricas (todas exceto a de rótulo)
+      for col in cols:
+          if col == label_col:
+              continue
+          series = (df[col].astype(str)
+                            .str.replace('"', '', regex=False)
+                            .str.replace(',', '.', regex=False))
+          vals = pd.to_numeric(series, errors='coerce')
+          df[col] = vals.apply(lambda v: 'x' if (pd.notna(v) and v > THRESHOLD) else '')
+
+      # Grava saída com mesmo cabeçalho e ordem
+      df.to_csv(OUT_PATH, sep=';', index=False, encoding='utf-8-sig')
+      print(f"Gerado: {OUT_PATH}")
+
+  if name == 'main':
+  main()
