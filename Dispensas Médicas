@@ -1,24 +1,31 @@
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# Caminho do arquivo
-file_path = r"C:\Python\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"
+# =========================
+# Configurações iniciais
+# =========================
+# Caminho do arquivo (AJUSTADO: agora em C:\BD\)
+file_path = r"C:\BD\Conversa do WhatsApp com Escala APP-SP  FMC-SP  TWR-SP.txt"
 
-# Leitura do arquivo
-with open(file_path, encoding='utf-8') as f:
-    lines = f.readlines()
-
-# Regex para nome + dias (ex: 3S Nome: 2 dias)
+# Regex
 linha_completa_regex = re.compile(
     r'\b(1S|2S|3S)\s+([\w\s\.\-Á-Úá-úçÇ]+?)\s*[:\-–]?\s*(\d+)\s+dia[s]?\b',
     re.IGNORECASE
 )
 data_regex = re.compile(r'^(\d{2}/\d{2}/\d{4}) \d{2}:\d{2} -')
 
-# Processar registros
+# =========================
+# Leitura do arquivo
+# =========================
+with open(file_path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+# =========================
+# Processamento dos registros
+# =========================
 registros = []
 
 print("🔍 Processando dispensas por pessoa...")
@@ -33,27 +40,42 @@ for line in tqdm(lines, desc="Analisando linhas"):
             nome = match.group(2).strip().title()
             dias = int(match.group(3))
             identificador = f"{graduacao} {nome}"
+
+            # Excluir 1S Solange
             if identificador.lower() == "1s solange":
                 continue
+
             registros.append((data, identificador, dias))
         except ValueError:
+            # Linhas que não batem com a data dd/mm/aaaa ou outra falha
             continue
 
-# Criar DataFrame
+# =========================
+# DataFrame base
+# =========================
 df = pd.DataFrame(registros, columns=["data", "pessoa", "dias"])
-df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
-df["mes"] = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
+if df.empty:
+    raise SystemExit("Nenhuma dispensa encontrada com o padrão especificado.")
 
-# Agrupamentos
+# Períodos derivados
+df["semana"] = df["data"].dt.to_period("W").apply(lambda r: r.start_time)
+df["mes"]    = df["data"].dt.to_period("M").apply(lambda r: r.start_time)
+
+# =========================
+# Agrupamentos tradicionais
+# =========================
 por_pessoa = df.groupby("pessoa")["dias"].sum().sort_values(ascending=True)
 por_semana = df.groupby("semana")["dias"].sum().reset_index()
-por_mes = df.groupby("mes")["dias"].sum().reset_index()
+por_mes    = df.groupby("mes")["dias"].sum().reset_index()
 media_semana = por_semana["dias"].mean()
-media_mes = por_mes["dias"].mean()
+media_mes    = por_mes["dias"].mean()
 
-# Gráfico por pessoa
+# =========================
+# GRÁFICOS tradicionais
+# =========================
+# Gráfico por pessoa (horizontal)
 plt.figure(figsize=(10, max(6, len(por_pessoa) * 0.3)))
-bars = plt.barh(por_pessoa.index, por_pessoa.values, color='skyblue')
+bars = plt.barh(por_pessoa.index, por_pessoa.values)
 for bar in bars:
     largura = bar.get_width()
     plt.text(largura + 0.5, bar.get_y() + bar.get_height() / 2,
@@ -65,10 +87,10 @@ plt.tight_layout()
 plt.grid(axis='x', linestyle='--', alpha=0.6)
 plt.show()
 
-# Gráfico por semana
+# Gráfico por semana (linha + área)
 plt.figure(figsize=(12, 5))
-plt.plot(por_semana["semana"], por_semana["dias"], marker='o', color='blue')
-plt.fill_between(por_semana["semana"], por_semana["dias"], color='lightblue')
+plt.plot(por_semana["semana"], por_semana["dias"], marker='o')
+plt.fill_between(por_semana["semana"], por_semana["dias"])
 plt.title("Dias de Dispensa Médica por Semana")
 plt.xlabel("Semana")
 plt.ylabel("Total de Dias")
@@ -77,10 +99,10 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-# Gráfico por mês
+# Gráfico por mês (linha + área)
 plt.figure(figsize=(10, 5))
-plt.plot(por_mes["mes"], por_mes["dias"], marker='o', color='green')
-plt.fill_between(por_mes["mes"], por_mes["dias"], color='lightgreen')
+plt.plot(por_mes["mes"], por_mes["dias"], marker='o')
+plt.fill_between(por_mes["mes"], por_mes["dias"])
 plt.title("Dias de Dispensa Médica por Mês")
 plt.xlabel("Mês")
 plt.ylabel("Total de Dias")
@@ -89,7 +111,57 @@ plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-# Exibir tabelas e médias
+# =========================
+# NOVO: Série temporal de DISPENSAS ATIVAS por dia
+# (sobreposição por duração)
+# =========================
+# Para cada dispensa, consideramos:
+# - início = df['data']
+# - fim    = df['data'] + (df['dias'] - 1) dias
+# Em seguida, criamos um "delta" com +1 em cada início e -1 em (fim + 1 dia).
+# O cumsum desses deltas ao longo do tempo dá a contagem de dispensas ativas por dia.
+
+df["inicio"] = df["data"]
+df["fim"]    = df["data"] + pd.to_timedelta(df["dias"] - 1, unit="D")
+
+# Criar séries de deltas
+print("⏱️ Calculando sobreposição por duração (linha de varredura)...")
+# Como podemos ter datas repetidas, agregamos por data
+start_increments = df.groupby("inicio").size().rename("start_inc")
+end_decrements   = df.groupby(df["fim"] + pd.Timedelta(days=1)).size().rename("end_dec") * -1
+
+# Combina os deltas e ordena
+deltas = pd.concat([start_increments, end_decrements], axis=1).fillna(0)
+deltas["delta"] = deltas["start_inc"] + deltas["end_dec"]
+deltas = deltas["delta"].sort_index()
+
+# Gera o índice diário completo entre o primeiro início e o último fim
+idx_full = pd.date_range(start=df["inicio"].min(),
+                         end=df["fim"].max(), freq="D")
+
+# Reindexa, preenche faltantes com 0, e aplica cumsum para obter as ativas
+deltas_full = deltas.reindex(idx_full, fill_value=0)
+ativas_por_dia = deltas_full.cumsum().rename("dispensas_ativas")
+
+# Opcional: média móvel (suavização)
+rolling_7d = ativas_por_dia.rolling(window=7, min_periods=1).mean()
+
+# Gráfico da série diária de dispensas ativas
+plt.figure(figsize=(12, 5))
+plt.plot(ativas_por_dia.index, ativas_por_dia.values, label="Ativas por dia")
+plt.plot(rolling_7d.index, rolling_7d.values, linestyle="--", label="Média móvel 7d")
+plt.fill_between(ativas_por_dia.index, ativas_por_dia.values, alpha=0.3)
+plt.title("Dispensas Médicas Ativas por Dia (sobreposição por duração)")
+plt.xlabel("Data")
+plt.ylabel("Quantidade de dispensas ativas")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Saídas textuais
+# =========================
 print("\n=== Dias de Dispensa por Semana ===")
 print(por_semana.to_string(index=False))
 
