@@ -1,0 +1,169 @@
+# Histograma de tempos de permanência por setor (BD_MOVIMENTO) — apenas 2024
+# Mostra linha vermelha de média em cada gráfico
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+df = dataset.copy()
+
+def find_col(name):
+    tgt = name.strip().upper()
+    for c in df.columns:
+        if str(c).strip().upper() == tgt:
+            return c
+    return None
+
+col_IND = find_col('INDICATIVO')
+col_S   = [find_col(f'S{i}') for i in range(1,5)]     # S1..S4
+col_H   = [find_col(f'H{i}C') for i in range(1,5)]    # H1C..H4C
+col_FIM = find_col('DHFIM')
+col_ANO = find_col('ANO')
+
+required = [col_IND, col_FIM] + col_S + col_H
+missing = [n for n, c in zip(['INDICATIVO','S1','S2','S3','S4','H1C','H2C','H3C','H4C','DHFIM'],
+                             [col_IND]+col_S+col_H+[col_FIM]) if c is None]
+
+def show_msg(msg, h=1.8):
+    fig, ax = plt.subplots(figsize=(7, h))
+    ax.axis('off')
+    ax.text(0.5, 0.5, msg, ha='center', va='center', fontsize=11, wrap=True)
+    plt.tight_layout()
+    plt.show()
+
+if missing:
+    show_msg("Faltam colunas no visual:\n" + ", ".join(missing))
+else:
+    def to_dt(s):
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return s
+        out = pd.to_datetime(s, errors='coerce', dayfirst=True, utc=False)
+        if out.isna().mean() > 0.8:
+            s_num = pd.to_numeric(s, errors='ignore')
+            if pd.api.types.is_numeric_dtype(s_num):
+                hh = (s_num // 100).astype('Int64')
+                mm = (s_num % 100).astype('Int64')
+                mask = hh.notna() & mm.notna() & hh.between(0,23) & mm.between(0,59)
+                base = pd.Timestamp('1970-01-01')
+                out2 = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
+                out2[mask] = base + pd.to_timedelta(hh[mask], unit='h') + pd.to_timedelta(mm[mask], unit='m')
+                out = out.where(~mask, out2)
+        if out.isna().all() and pd.api.types.is_numeric_dtype(s):
+            base = pd.Timestamp('1970-01-01')
+            out = base + pd.to_timedelta(s, unit='m')
+        return out
+
+    # ---- FILTRO 2024 ----
+    if col_ANO is not None:
+        df = df[df[col_ANO] == 2024].copy()
+    else:
+        fim_tmp = to_dt(df[col_FIM])
+        df = df[fim_tmp.dt.year == 2024].copy()
+
+    if df.empty:
+        show_msg("Sem dados para 2024 após o filtro.")
+    else:
+        H = [to_dt(df[c]) for c in col_H]
+        FIM = to_dt(df[col_FIM])
+
+        dur_frames = []
+        for i in range(4):  # S1..S4
+            setor_raw = df[col_S[i]]
+            setor = setor_raw.where(setor_raw.notna(), '').astype(str).str.strip()
+            setor = setor.where(setor != '', np.nan)
+
+            start = H[i]
+
+            if i < 3:
+                next_setor_raw = df[col_S[i+1]]
+                next_setor = next_setor_raw.where(next_setor_raw.notna(), '').astype(str).str.strip()
+                next_has_sector = next_setor != ''
+                next_start = H[i+1]
+                cond = next_has_sector & next_start.notna()
+                end = next_start.where(cond, FIM)
+                mask_dhfim = ~cond
+            else:
+                end = FIM
+                mask_dhfim = pd.Series(True, index=df.index)
+
+            start2 = start.copy()
+            try:
+                single_date = start.dt.floor('D').nunique(dropna=True) == 1
+            except Exception:
+                single_date = False
+
+            if single_date:
+                start_offset = start - start.dt.floor('D')
+                start_aligned = end.dt.floor('D') + start_offset
+                start2 = start2.where(~mask_dhfim, start_aligned)
+
+            delta = end - start2
+            neg = delta.dt.total_seconds() < 0
+            delta = delta.where(~neg, delta + pd.Timedelta(days=1))
+
+            dmins = delta.dt.total_seconds() / 60.0
+
+            tmp = pd.DataFrame({
+                'Indicativo': df[col_IND],
+                'Setor': setor,
+                'DurMin': dmins
+            }).dropna(subset=['Setor','DurMin'])
+
+            upper_setor = tmp['Setor'].str.upper().str.strip()
+            tmp = tmp[(upper_setor.str.startswith('T') | (upper_setor == 'VFR'))]
+            tmp = tmp[(tmp['DurMin'] >= 1) & (tmp['DurMin'] <= 60)]
+            tmp['Setor'] = upper_setor.replace({'VFR': 'T14'})
+            dur_frames.append(tmp)
+
+        long_df = (pd.concat(dur_frames, ignore_index=True)
+                   if dur_frames else pd.DataFrame(columns=['Indicativo','Setor','DurMin']))
+
+        if long_df.empty:
+            show_msg("Sem dados válidos (2024, 1–60 min).")
+        else:
+            setores = [f"T{i}" for i in range(1,15)]
+            bins = np.arange(0, 65, 5)  # 0–60, passo 5
+            ncols = 3
+            nrows = int(np.ceil(len(setores) / ncols))
+
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12, nrows*3))
+            axes = axes.flatten()
+
+            for i, setor in enumerate(setores):
+                ax = axes[i]
+                data = long_df.loc[long_df['Setor'] == setor, 'DurMin']
+                if data.empty:
+                    ax.text(0.5, 0.5, 'Sem dados', ha='center', va='center', fontsize=10)
+                    ax.set_xlim(0, 60)
+                    ax.set_ylim(0, 1)
+                else:
+                    counts, edges, patches = ax.hist(data, bins=bins, color='skyblue', edgecolor='black')
+                    ax.set_xlim(0, 60)
+                    ax.set_ylim(0, max(counts) * 1.35)
+
+                    # Rótulos de barras
+                    for c, left, right in zip(counts, edges[:-1], edges[1:]):
+                        if c > 0:
+                            ax.text((left + right)/2, c + max(counts)*0.02, int(c),
+                                    ha='center', va='bottom', fontsize=8)
+
+                    # ---- Linha da média ----
+                    mean_val = data.mean()
+                    ax.axvline(mean_val, color='red', linestyle='--', linewidth=1.5)
+                    ax.text(mean_val + 0.3, max(counts)*1.1,
+                            f"Média = {mean_val:.1f} min", color='red',
+                            rotation=90, va='bottom', ha='left', fontsize=8,
+                            backgroundcolor='white', alpha=0.7)
+
+                # Título e eixos
+                ax.set_title(f'{setor}', fontsize=11, y=1.02)
+                ax.set_xlabel('Tempo de permanência (min)')
+                ax.set_ylabel('Ocorrências')
+                ax.grid(alpha=0.3)
+
+            # Remove eixos extras se houver
+            for j in range(i+1, len(axes)):
+                fig.delaxes(axes[j])
+
+            plt.subplots_adjust(left=0.07, right=0.98, top=0.94, bottom=0.08, hspace=0.6)
+            plt.tight_layout()
+            plt.show()
