@@ -37,7 +37,6 @@ else:
         if pd.api.types.is_datetime64_any_dtype(s):
             return s
         out = pd.to_datetime(s, errors='coerce', dayfirst=True, utc=False)
-        # tenta padrão numérico HHMM (ex.: 800 -> 08:00)
         if out.isna().mean() > 0.8:
             s_num = pd.to_numeric(s, errors='ignore')
             if pd.api.types.is_numeric_dtype(s_num):
@@ -48,7 +47,6 @@ else:
                 out2 = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
                 out2[mask] = base + pd.to_timedelta(hh[mask], unit='h') + pd.to_timedelta(mm[mask], unit='m')
                 out = out.where(~mask, out2)
-        # fallback: minutos após 00:00
         if out.isna().all() and pd.api.types.is_numeric_dtype(s):
             base = pd.Timestamp('1970-01-01')
             out = base + pd.to_timedelta(s, unit='m')
@@ -70,7 +68,6 @@ else:
         dur_frames = []
         for i in range(4):  # S1..S4
             setor_raw = df[col_S[i]]
-            # evita "nan" como texto
             setor = setor_raw.where(setor_raw.notna(), '').astype(str).str.strip()
             setor = setor.where(setor != '', np.nan)
 
@@ -111,8 +108,9 @@ else:
                 'DurMin': dmins
             }).dropna(subset=['Setor','DurMin'])
 
+            # ---- FILTRO DE VALORES VÁLIDOS ----
             tmp = tmp[tmp['Setor'].str.upper().str.startswith('T')]
-            tmp = tmp[tmp['DurMin'] >= 0]
+            tmp = tmp[(tmp['DurMin'] >= 1) & (tmp['DurMin'] <= 60)]
             dur_frames.append(tmp)
 
         long_df = (pd.concat(dur_frames, ignore_index=True)
@@ -121,13 +119,19 @@ else:
         avg = (long_df.groupby('Setor', dropna=True)['DurMin']
                .mean()
                .round(2)
-               .sort_values(ascending=False)
                .reset_index())
-        avg.columns = ['Setor', 'Tempo médio (min)']
 
-        # Tabela
+        # ---- ORDEM FIXA: T1..T13, VFR (como T14) ----
+        ordem = [f"T{i}" for i in range(1, 14)] + ["VFR"]
+        avg['Setor'] = avg['Setor'].str.upper().str.strip()
+        avg['Setor'] = avg['Setor'].replace({'VFR': 'T14'})  # trata VFR como T14
+        avg = avg[avg['Setor'].isin([f"T{i}" for i in range(1,15)])]
+        avg['Setor'] = pd.Categorical(avg['Setor'], categories=[f"T{i}" for i in range(1,15)], ordered=True)
+        avg = avg.sort_values('Setor').rename(columns={'DurMin': 'Tempo médio (min)'})
+
+        # Renderiza tabela
         if avg.empty:
-            show_msg("Sem dados suficientes para calcular tempos médios (filtro 2024).")
+            show_msg("Sem dados suficientes para calcular tempos médios (2024, 1–60 min).")
         else:
             fig_h = 0.6 + 0.35*len(avg)
             fig, ax = plt.subplots(figsize=(6.5, fig_h))
