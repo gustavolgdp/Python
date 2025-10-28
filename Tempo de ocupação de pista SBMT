@@ -10,11 +10,11 @@ from tqdm import tqdm
 # ===========================
 ARQ = r"C:\BD\SBMT_2024_01_01_A_2024_12_31.xlsx"
 RUNWAY_FILTER = {"12"}   # considerar apenas pista 12
-# Fórmulas solicitadas:
-# TOPP = (Aeronave Estacionada - 2 min) - Pouso Real
-# TOPD = Decolagem - (Aeronave Estacionada - 1 min)
-TOPP_VACATE_OFFSET = timedelta(minutes=2)
-TOPD_LEAVE_STAND_OFFSET = timedelta(minutes=1)
+# Fórmulas AJUSTADAS:
+# TOPD = Decolagem - (Posição 3 - 1,5 min)
+# TOPP = (Aeronave Estacionada - 5 min) - Pouso Real
+TOPD_POS3_OFFSET = timedelta(minutes=1.5)
+TOPP_VACATE_OFFSET = timedelta(minutes=5)
 # Limites para filtrar outliers (em segundos)
 MIN_TOP_SEC = 0
 MAX_TOP_SEC = 900
@@ -22,14 +22,12 @@ MAX_TOP_SEC = 900
 # ===========================
 # Tabela ICAO (helicópteros)
 # ===========================
-# Conjunto de designativos ICAO para helicópteros (principais e comuns no Brasil).
-# Fonte: ICAO Doc 8643 (lista consolidada manualmente — pode ampliar se precisar).
 HELI_SET = {
     # Airbus/Eurocopter
     "AS50","AS55","AS65","AS32","AS35","AS52","AS53","AS54","AS56","AS57","AS58","AS60","AS61","AS62","AS63",
     "EC20","EC25","EC30","EC35","EC45","EC55","EC75",
     "H120","H125","H130","H135","H145","H155","H160","H175","H215","H225",
-    "BK17",  # BK117 (EC145/H145 base)
+    "BK17",
     # Bell
     "B06","B204","B205","B206","B212","B214","B222","B230","B412","B430","B505","B407","B429",
     # Robinson
@@ -91,12 +89,14 @@ idx_pista = find_idx([["pista"]], header)
 idx_equip = find_idx([["equipamento","acft","tipo"]], header)
 idx_decol = find_idx([["decolagem","dec"]], header)
 idx_pouso = find_idx([["pouso real","pouso"]], header)
+idx_pos3 = find_idx([["posição 3","posicao 3","pos3"]], header)
 idx_estac = find_idx([["aeronave estacionada","estacionada","blkon"]], header)
 
 missing = []
 for nome, idx in {
     "Pista": idx_pista, "Equipamento": idx_equip,
-    "Decolagem": idx_decol, "Pouso Real": idx_pouso, "Aeronave Estacionada/BLKon": idx_estac
+    "Decolagem": idx_decol, "Pouso Real": idx_pouso, 
+    "Posição 3": idx_pos3, "Aeronave Estacionada/BLKon": idx_estac
 }.items():
     if idx is None: missing.append(nome)
 if missing:
@@ -107,6 +107,7 @@ print(" Pista:", header[idx_pista])
 print(" Equipamento:", header[idx_equip])
 print(" Decolagem:", header[idx_decol])
 print(" Pouso Real:", header[idx_pouso])
+print(" Posição 3:", header[idx_pos3])
 print(" Aeronave Estacionada/BLKon:", header[idx_estac])
 
 # ===========================
@@ -137,7 +138,6 @@ print(f"Asa fixa (usados no cálculo):    {len(fixed_wing)} -> {fixed_wing}")
 # ===========================
 # Etapa 2 — cálculo do TOP apenas ASA FIXA
 # ===========================
-# Reiterar as linhas (streaming novamente) e calcular somente quando Equipamento ∈ fixed_wing
 TOPD, TOPP = [], []
 cand_dep = cand_dep_ok = 0
 cand_arr = cand_arr_ok = 0
@@ -155,18 +155,18 @@ for row in tqdm(it_calc, total=total, desc="Calculando TOP (asa fixa)"):
     if eq_code not in fixed_wing:
         continue  # ignora helicópteros/indefinidos
 
-    # TOPD: Decolagem - (Estacionada - 1min)
-    t_dec   = to_dt(row[idx_decol])
-    t_estac = to_dt(row[idx_estac])
-    if t_dec and t_estac:
+    # TOPD: Decolagem - (Posição 3 - 1,5min)
+    t_dec = to_dt(row[idx_decol])
+    t_pos3 = to_dt(row[idx_pos3])
+    if t_dec and t_pos3:
         cand_dep += 1
-        leave_stand = t_estac - TOPD_LEAVE_STAND_OFFSET
-        dt_dep = (t_dec - leave_stand).total_seconds()
+        ref_time = t_pos3 - TOPD_POS3_OFFSET
+        dt_dep = (t_dec - ref_time).total_seconds()
         if dt_dep is not None and (dt_dep > MIN_TOP_SEC) and (dt_dep <= MAX_TOP_SEC):
             TOPD.append(dt_dep); cand_dep_ok += 1
 
-    # TOPP: (Estacionada - 2min) - Pouso Real
-    t_pos   = to_dt(row[idx_pouso])
+    # TOPP: (Estacionada - 5min) - Pouso Real
+    t_pos = to_dt(row[idx_pouso])
     t_estac = to_dt(row[idx_estac])
     if t_pos and t_estac:
         cand_arr += 1
@@ -180,11 +180,10 @@ st_decol = stats(TOPD)
 st_pouso = stats(TOPP)
 st_geral = stats(TOPD + TOPP) if (TOPD or TOPP) else {"n":0,"mean_s":np.nan}
 mixed_mean = (st_pouso["mean_s"] + st_decol["mean_s"]) / 2.0 if (st_pouso["n"]>0 and st_decol["n"]>0) else np.nan
-more_restrictive = max(st_pouso["mean_s"], st_decol["mean_s"]) if (st_pouso["n"]>0 and st_decol["n"]>0) else np.nan
 
 print("\n--- Diagnóstico (asa fixa | pista 12) ---")
-print(f"Decolagens elegíveis (Decolagem & Estacionada): {cand_dep} | válidos TOPD: {cand_dep_ok}")
-print(f"Pousos elegíveis (Pouso Real & Estacionada):   {cand_arr} | válidos TOPP: {cand_arr_ok}")
+print(f"Decolagens elegíveis (Decolagem & Posição 3): {cand_dep} | válidos TOPD: {cand_dep_ok}")
+print(f"Pousos elegíveis (Pouso Real & Estacionada): {cand_arr} | válidos TOPP: {cand_arr_ok}")
 
 resumo = pd.DataFrame([
     ["Geral (TOP de todos os movimentos) [pista 12 | asa fixa]", st_geral["n"], st_geral["mean_s"], s_to_min(st_geral["mean_s"])],
@@ -197,8 +196,5 @@ pd.set_option("display.max_colwidth", None)
 print("\n=== Resumo — TOP (SBMT 2024 | pista 12 | asa fixa) ===")
 print(resumo.to_string(index=False))
 
-# Opcional: salvar listas e resumo
-# pd.Series(sorted(equip_set)).to_excel(r"C:\BD\equipamentos_pista12.xlsx", index=False, header=["Equipamento"])
-# pd.Series(helicopters).to_excel(r"C:\BD\equipamentos_helicopteros.xlsx", index=False, header=["Helicopteros (ICAO)"])
-# pd.Series(fixed_wing).to_excel(r"C:\BD\equipamentos_asafixa.xlsx", index=False, header=["Asa Fixa"])
+# Opcional: salvar resultados
 # resumo.to_excel(r"C:\BD\TOP_SBMT_2024_PISTA12_ASAFIXA.xlsx", index=False)
