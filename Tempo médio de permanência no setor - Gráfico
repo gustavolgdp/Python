@@ -1,0 +1,234 @@
+# Tempo médio de permanência por setor (BD_MOVIMENTO) — ANO 2024 x 2025 em gráfico
+# Requer no visual: INDICATIVO, S1..S4, H1C..H4C, DHFIM, HTER, ANO
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+df = dataset.copy()
+
+def find_col(name):
+    tgt = name.strip().upper()
+    for c in df.columns:
+        if str(c).strip().upper() == tgt:
+            return c
+    return None
+
+col_IND = find_col('INDICATIVO')
+col_S   = [find_col(f'S{i}') for i in range(1,5)]     # S1..S4
+col_H   = [find_col(f'H{i}C') for i in range(1,5)]    # H1C..H4C
+col_FIM = find_col('DHFIM')                           # fim "geral"
+col_TER = find_col('HTER')                            # horário final de setor
+col_ANO = find_col('ANO')                             # CALENDARIO[ANO] no visual
+
+missing = [n for n, c in zip(
+    ['INDICATIVO','S1','S2','S3','S4','H1C','H2C','H3C','H4C','DHFIM','HTER','ANO'],
+    [col_IND]+col_S+col_H+[col_FIM,col_TER,col_ANO]
+) if c is None]
+
+def show_msg(msg, h=1.8):
+    fig, ax = plt.subplots(figsize=(7, h))
+    ax.axis('off')
+    ax.text(0.5, 0.5, msg, ha='center', va='center', fontsize=11, wrap=True)
+    plt.tight_layout()
+    plt.show()
+
+if missing:
+    show_msg("Faltam colunas no visual:\n" + ", ".join(missing))
+
+else:
+    def to_dt(s):
+        if pd.api.types.is_datetime64_any_dtype(s):
+            return s
+        out = pd.to_datetime(s, errors='coerce', dayfirst=True, utc=False)
+        if out.isna().mean() > 0.8:
+            s_num = pd.to_numeric(s, errors='ignore')
+            if pd.api.types.is_numeric_dtype(s_num):
+                hh = (s_num // 100).astype('Int64')
+                mm = (s_num % 100).astype('Int64')
+                mask = hh.notna() & mm.notna() & hh.between(0,23) & mm.between(0,59)
+                base = pd.Timestamp('1970-01-01')
+                out2 = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
+                out2[mask] = base + pd.to_timedelta(hh[mask], unit='h') \
+                                   + pd.to_timedelta(mm[mask], unit='m')
+                out = out.where(~mask, out2)
+        if out.isna().all() and pd.api.types.is_numeric_dtype(s):
+            base = pd.Timestamp('1970-01-01')
+            out = base + pd.to_timedelta(s, unit='m')
+        return out
+
+    def col_vazia(idx):
+        c = col_S[idx]
+        if c is None:
+            return pd.Series(True, index=df.index)
+        s = df[c]
+        s = s.where(s.notna(), '').astype(str).str.strip()
+        return s.eq('')
+
+    # ---- ANO efetivo ----
+    fim_base = to_dt(df[col_FIM])
+    anos_vis = pd.to_numeric(df[col_ANO], errors='coerce')
+    anos_eff = anos_vis.where(~anos_vis.isna(), fim_base.dt.year)
+    df['ANO_GRP'] = anos_eff
+    df = df[df['ANO_GRP'].isin([2024, 2025])].copy()
+
+    if df.empty:
+        show_msg("Sem dados para ANO 2024 ou 2025 após os filtros.")
+    else:
+        H   = [to_dt(df[c]) for c in col_H]
+        FIM = to_dt(df[col_FIM])
+        TER = to_dt(df[col_TER])
+
+        # Auxiliares S2
+        s2_raw = df[col_S[1]] if col_S[1] else None
+        if s2_raw is not None:
+            s2_up = s2_raw.where(s2_raw.notna(), '').astype(str).str.upper().str.strip()
+            s2_is_T9  = s2_up.eq('T9')
+            s2_is_T10 = s2_up.eq('T10')
+        else:
+            s2_is_T9  = pd.Series(False, index=df.index)
+            s2_is_T10 = pd.Series(False, index=df.index)
+
+        dur_frames = []
+
+        for i in range(4):
+            setor_raw = df[col_S[i]]
+            setor = setor_raw.where(setor_raw.notna(), '').astype(str).str.strip()
+            setor = setor.where(setor != '', np.nan)
+            start = H[i]
+
+            upper = setor.str.upper().str.strip()
+            is_T9_12 = upper.isin(['T9','T10','T11','T12'])
+            is_vfr   = upper.eq('VFR')
+            is_T6    = upper.eq('T6')
+            is_T4    = upper.eq('T4')
+
+            # ----------- regra T6: só quando S2 = T9 ----------------
+            setor = setor.where(~is_T6 | s2_is_T9, np.nan)
+
+            # ----------- regra T4: só quando S2 = T10 ----------------
+            setor = setor.where(~is_T4 | s2_is_T10, np.nan)
+
+            # atualizar após descartar T4/T6 inválidos
+            upper = setor.str.upper().str.strip()
+            is_T9_12 = upper.isin(['T9','T10','T11','T12'])
+            is_vfr   = upper.eq('VFR')
+            is_T6    = upper.eq('T6')
+            is_T4    = upper.eq('T4')
+
+            # ----------- VFR: só quando S1 = VFR e S2..S4 vazios ---------------
+            if i == 0:
+                empty_S2 = col_vazia(1)
+                empty_S3 = col_vazia(2)
+                empty_S4 = col_vazia(3)
+                vfr_ok = is_vfr & empty_S2 & empty_S3 & empty_S4 & TER.notna()
+                setor = setor.where(~(is_vfr & ~vfr_ok), np.nan)
+            else:
+                setor = setor.where(~is_vfr, np.nan)
+
+            # atualizar
+            upper = setor.str.upper().str.strip()
+            is_T9_12 = upper.isin(['T9','T10','T11','T12'])
+            is_vfr   = upper.eq('VFR')
+
+            # ----------- fim padrão ----------------
+            if i < 3:
+                next_s_raw = df[col_S[i+1]]
+                next_s = next_s_raw.where(next_s_raw.notna(), '').astype(str).str.strip()
+                next_has = next_s != ''
+                next_start = H[i+1]
+                cond = next_has & next_start.notna()
+                end = next_start.where(cond, FIM)
+                mask_align = ~cond
+            else:
+                end = FIM.copy()
+                mask_align = pd.Series(True, index=df.index)
+
+            # ----------- regras especiais T9–T12 e VFR_OK: usar HTER ----------
+            end = end.where(~is_T9_12, TER)
+            end = end.where(~is_vfr, TER)
+
+            mask_align = mask_align | is_T9_12 | is_vfr
+
+            # ----------- alinhamento de data -------------
+            start2 = start.copy()
+            try:
+                single_date = start.dt.floor('D').nunique(dropna=True) == 1
+            except:
+                single_date = False
+
+            if single_date:
+                offset = start - start.dt.floor('D')
+                aligned = end.dt.floor('D') + offset
+                start2 = start2.where(~mask_align, aligned)
+
+            delta = end - start2
+            neg = delta.dt.total_seconds() < 0
+            delta = delta.where(~neg, delta + pd.Timedelta(days=1))
+
+            dmins = delta.dt.total_seconds()/60.0
+
+            tmp = pd.DataFrame({
+                'ANO': df['ANO_GRP'],
+                'Indicativo': df[col_IND],
+                'Setor': setor,
+                'DurMin': dmins
+            }).dropna(subset=['Setor','DurMin','ANO'])
+
+            # ----------- filtros finais ----------------
+            upperS = tmp['Setor'].str.upper().str.strip()
+            tmp = tmp[(upperS.str.startswith('T')) | (upperS == 'VFR')]
+            tmp = tmp[(tmp['DurMin'] >= 1) & (tmp['DurMin'] <= 40)]
+
+            dur_frames.append(tmp)
+
+        if not dur_frames:
+            show_msg("Sem durações válidas (1 a 40 min) para 2024/2025.")
+        else:
+            long_df = pd.concat(dur_frames, ignore_index=True)
+            if long_df.empty:
+                show_msg("Sem dados após filtros.")
+            else:
+                long_df['Setor'] = long_df['Setor'].str.upper().str.strip()
+                avg = long_df.groupby(['ANO','Setor'])['DurMin'].mean().reset_index()
+
+                categorias = [f"T{i}" for i in range(1,14)] + ['VFR']
+                avg = avg[avg['Setor'].isin(categorias)]
+
+                pivot = avg.pivot(index='Setor', columns='ANO', values='DurMin')
+                pivot = pivot.reindex(categorias)
+
+                pivot[2024] = pivot.get(2024, 0).fillna(0)
+                pivot[2025] = pivot.get(2025, 0).fillna(0)
+
+                v24 = pivot[2024].to_numpy()
+                v25 = pivot[2025].to_numpy()
+
+                fig, ax = plt.subplots(figsize=(12, 5))
+                x = np.arange(len(categorias))
+                width = 0.38
+
+                b1 = ax.bar(x-width/2, v24, width, label='2024')
+                b2 = ax.bar(x+width/2, v25, width, label='2025')
+
+                ax.set_xticks(x)
+                ax.set_xticklabels(categorias)
+                ax.set_ylabel('Tempo médio no setor (min)')
+                ax.set_title('Tempo médio por setor — 2024 x 2025 (≤ 40 min)')
+                ax.grid(axis='y', linestyle='--', alpha=0.3)
+                ax.legend()
+
+                def annotate(bars):
+                    for b in bars:
+                        h = b.get_height()
+                        ax.annotate(f"{h:.1f}",
+                                    xy=(b.get_x()+b.get_width()/2, h),
+                                    xytext=(0,3),
+                                    textcoords="offset points",
+                                    ha='center', va='bottom', fontsize=8)
+
+                annotate(b1)
+                annotate(b2)
+
+                plt.tight_layout()
+                plt.show()
